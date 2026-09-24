@@ -239,6 +239,10 @@ impl SketchImport {
         let mut last: Option<sketch_solve_core::SolveReport> = None;
         // The targets (dimensions + externals) the current geometry satisfies.
         let mut good = self.targets();
+        // The original seed: a genuine solved state, used to restart across a
+        // jump when interpolating through it fails (a CAD system re-solves from
+        // its stored sketch, which is the same idea).
+        let seed_x = self.sketch.x.clone();
         while t < 1.0 {
             let target = (t + step).min(1.0);
             let saved = self.sketch.x.clone();
@@ -279,6 +283,24 @@ impl SketchImport {
                 good = wanted;
                 step = (step * 2.0).min(1.0 - t).max(1e-6);
                 continue;
+            }
+            // A jump the interpolation cannot cross: restart from the seed.
+            if step <= 1e-3 {
+                self.sketch.x = seed_x.clone();
+                self.set_targets(&wanted);
+                let r2 = sketch_solve_core::solve(&mut self.sketch, sketch_solve_core::SolveOptions { max_iterations: 3 * opts.max_iterations, ..opts })
+                    .map_err(|e| ImportError(format!("{}: {e}", self.name)))?;
+                steps += 1;
+                if trace {
+                    eprintln!("  restart from seed at t={target:.4}: converged {} in {} iterations, residual {:.2e}", r2.converged, r2.iterations, r2.max_residual);
+                }
+                if r2.converged {
+                    t = target;
+                    last = Some(r2);
+                    good = wanted;
+                    step = (step * 2.0).min(1.0 - t).max(1e-6);
+                    continue;
+                }
             }
             self.sketch.x = saved;
             self.set_targets(&good);
@@ -611,7 +633,30 @@ impl Builder<'_> {
 
 // ---------------------------------------------------------------- entities
 
-fn add_entity(b: &mut Builder, e: &Json) -> Result<(), ImportError> {
+/// Entity ids whose arcs must keep the centre / angle representation: their
+/// centre is referenced, or their radius is dimensioned or equated, so they
+/// can never flatten and the derived-centre form only adds nonlinearity.
+fn arcs_with_centre_constraints(m: &Json) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for c in m["constraints"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let cm = msg(c);
+        let ty = cm["constraintType"].as_str().unwrap_or("");
+        for p in cm["parameters"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            if p["typeName"] != "BTMParameterString" {
+                continue;
+            }
+            let Some(v) = msg(p)["value"].as_str() else { continue };
+            if let Some(base) = v.strip_suffix(".center") {
+                out.insert(base.to_string());
+            } else if matches!(ty, "RADIUS" | "DIAMETER" | "EQUAL") && !v.contains('.') {
+                out.insert(v.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn add_entity(b: &mut Builder, e: &Json, keep_centre: &std::collections::HashSet<String>) -> Result<(), ImportError> {
     let m = msg(e);
     let id = m["entityId"].as_str().ok_or_else(|| ImportError("entity without id".into()))?.to_string();
     let g = &m["geometry"];
@@ -633,7 +678,7 @@ fn add_entity(b: &mut Builder, e: &Json) -> Result<(), ImportError> {
             // Parameters are angles from the circle's x direction; a clockwise
             // circle's parameter runs the other way.
             let (a0, a1) = if cw { (rot - t0, rot - t1) } else { (rot + t0, rot + t1) };
-            add_arc_entity(&mut b.sketch, c, r, a0, a1, !cw)
+            add_arc_entity(&mut b.sketch, c, r, a0, a1, !cw, keep_centre.contains(&id))
         }
         ("BTMSketchCurve", "BTCurveGeometryCircle") => {
             b.sketch.add_circle([f(gm, "xCenter")?, f(gm, "yCenter")?], f(gm, "radius")?, false)
@@ -651,7 +696,7 @@ fn add_entity(b: &mut Builder, e: &Json) -> Result<(), ImportError> {
 /// Arcs are stored as endpoints plus bulge unless the sweep is nearly a
 /// full turn (a "circle drawn as an arc"), which the bulge form cannot
 /// represent; those keep the centre / angle form.
-fn add_arc_entity(sk: &mut Sketch, c: [f64; 2], r: f64, a0: f64, a1: f64, ccw: bool) -> EntId {
+fn add_arc_entity(sk: &mut Sketch, c: [f64; 2], r: f64, a0: f64, a1: f64, ccw: bool, keep_centre: bool) -> EntId {
     let tau = std::f64::consts::TAU;
     let mut sweep = (a1 - a0) % tau;
     if ccw && sweep <= 0.0 {
@@ -659,7 +704,7 @@ fn add_arc_entity(sk: &mut Sketch, c: [f64; 2], r: f64, a0: f64, a1: f64, ccw: b
     } else if !ccw && sweep >= 0.0 {
         sweep -= tau;
     }
-    if sweep.abs() > 1.9 * std::f64::consts::PI {
+    if keep_centre || sweep.abs() > 1.9 * std::f64::consts::PI {
         return sk.add_arc(c, r, a0, a1, ccw, false);
     }
     let a = [c[0] + r * a0.cos(), c[1] + r * a0.sin()];
@@ -929,8 +974,9 @@ pub fn import_sketch(feature: &Json, scope: &dyn Scope, resolver: &dyn ExternalR
         coincident: Vec::new(),
         on_curve: Vec::new(),
     };
+    let keep_centre = arcs_with_centre_constraints(m);
     for e in m["entities"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-        add_entity(&mut b, e).map_err(|err| ImportError(format!("{name}: {err}")))?;
+        add_entity(&mut b, e, &keep_centre).map_err(|err| ImportError(format!("{name}: {err}")))?;
     }
     // Pre-pass: coincidences and point-on-curve facts, so tangencies built
     // earlier in the list can still find the meeting point.
