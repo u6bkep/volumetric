@@ -206,13 +206,99 @@ impl SketchImport {
     }
 
     /// Solve from the current (satisfied) state to the dimensions evaluated at
-    /// `scope` and the externals already set, by continuation. Angle targets
-    /// re-select their branch at every step.
+    /// `scope` (externals as already set), by continuation in dimension space.
     pub fn solve_towards(&mut self, scope: &dyn Scope, opts: sketch_solve_core::SolveOptions) -> Result<sketch_solve_core::SolveReport, ImportError> {
         let from = self.targets();
         self.set_dimensions(scope)?;
         let to = self.targets();
         self.set_targets(&from);
+        self.solve_between(&from, &to, opts)
+    }
+
+    /// Solve by continuation along a path of configurations: `scope_at(t)`
+    /// gives the variable scope and `externals_at(t)` the fixed external
+    /// geometry at path parameter `t` in [0, 1] (0 = the state the current
+    /// geometry satisfies, 1 = the wanted one). Dimensions are re-evaluated
+    /// at every step so intermediate states are real configurations of the
+    /// model. Where the expressions jump (tables, floor, branches) a step
+    /// cannot be made small, so a stuck step is retried as a continuation in
+    /// dimension space across the jump alone.
+    pub fn solve_along(
+        &mut self,
+        scope_at: &dyn Fn(f64) -> Box<dyn Scope>,
+        externals_at: &dyn Fn(f64) -> Vec<(String, ExternalGeom)>,
+        opts: sketch_solve_core::SolveOptions,
+    ) -> Result<sketch_solve_core::SolveReport, ImportError> {
+        let trace = std::env::var_os("SKETCH_TRACE").is_some();
+        let mut t: f64 = 0.0;
+        // Start with a small step: a large first move can land on a different
+        // root of a sensitive sub-system (a flat arc joining a fillet), which
+        // is a locked state the path can never leave. Steps double on success.
+        let mut step: f64 = std::env::var("SKETCH_STEP0").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0 / 64.0);
+        let mut steps = 0;
+        let mut last: Option<sketch_solve_core::SolveReport> = None;
+        // The targets (dimensions + externals) the current geometry satisfies.
+        let mut good = self.targets();
+        while t < 1.0 {
+            let target = (t + step).min(1.0);
+            let saved = self.sketch.x.clone();
+            self.set_dimensions(scope_at(target).as_ref())?;
+            for (id, g) in externals_at(target) {
+                self.set_external(&id, g)?;
+            }
+            let wanted = self.targets();
+            let r = sketch_solve_core::solve(&mut self.sketch, opts).map_err(|e| ImportError(format!("{}: {e}", self.name)))?;
+            steps += 1;
+            if trace {
+                eprintln!("  path t={t:.4} -> {target:.4}: converged {} in {} iterations, residual {:.2e}", r.converged, r.iterations, r.max_residual);
+            }
+            if r.converged {
+                t = target;
+                last = Some(r);
+                good = wanted;
+                step = (step * 2.0).min(1.0 - t).max(1e-6);
+                continue;
+            }
+            // Retry a small step as a continuation in dimension space from the
+            // last good state (fine for smooth changes, and the only way across
+            // a jump in the expressions); larger steps are just halved.
+            self.sketch.x = saved.clone();
+            self.set_targets(&good);
+            if step > 0.0625 {
+                step /= 2.0;
+                continue;
+            }
+            let mut r = self.solve_between(&good, &wanted, opts)?;
+            if trace {
+                eprintln!("  retry t={t:.4} -> {target:.4} in dimension space: converged {} in {} steps, residual {:.2e}", r.converged, r.iterations, r.max_residual);
+            }
+            steps += r.iterations;
+            if r.converged {
+                t = target;
+                last = Some(r);
+                good = wanted;
+                step = (step * 2.0).min(1.0 - t).max(1e-6);
+                continue;
+            }
+            self.sketch.x = saved;
+            self.set_targets(&good);
+            if step > 1e-4 {
+                step /= 2.0;
+                continue;
+            }
+            r.iterations = steps;
+            r.progress = t;
+            return Ok(r);
+        }
+        let mut r = last.unwrap_or(sketch_solve_core::SolveReport { converged: true, iterations: 0, max_residual: 0.0, worst_constraint: None, free_vars: 0, equations: 0, progress: 1.0 });
+        r.iterations = steps;
+        r.progress = 1.0;
+        Ok(r)
+    }
+
+    /// Continuation in dimension space between two target vectors (see
+    /// [`targets`](Self::targets)).
+    fn solve_between(&mut self, from: &[f64], to: &[f64], opts: sketch_solve_core::SolveOptions) -> Result<sketch_solve_core::SolveReport, ImportError> {
         let mut sketch = std::mem::take(&mut self.sketch);
         let dims = self.dimensions.clone();
         let fixed: Vec<usize> = (0..sketch.x.len()).filter(|&v| sketch.fixed[v]).collect();
@@ -226,34 +312,6 @@ impl SketchImport {
             }
         });
         self.sketch = sketch;
-        r.map_err(|e| ImportError(format!("{}: {e}", self.name)))
-    }
-
-    /// Solve by continuation along a path of scopes: `scope_at(t)` gives the
-    /// variable scope at parameter `t` in [0, 1] (0 = the configuration the
-    /// current geometry satisfies, 1 = the wanted one). Every dimension is
-    /// re-evaluated at each step, so intermediate states are real
-    /// configurations of the model rather than interpolated dimension values,
-    /// which matters when expressions are piecewise (tables, floor, branches).
-    pub fn solve_along(
-        &mut self,
-        scope_at: &dyn Fn(f64) -> Box<dyn Scope>,
-        opts: sketch_solve_core::SolveOptions,
-    ) -> Result<sketch_solve_core::SolveReport, ImportError> {
-        let mut sketch = std::mem::take(&mut self.sketch);
-        let mut err = None;
-        let r = sketch_solve_core::solve_continuation(&mut sketch, opts, |sk, t| {
-            let scope = scope_at(t);
-            std::mem::swap(&mut self.sketch, sk);
-            if let Err(e) = self.set_dimensions(scope.as_ref()) {
-                err.get_or_insert(e);
-            }
-            std::mem::swap(&mut self.sketch, sk);
-        });
-        self.sketch = sketch;
-        if let Some(e) = err {
-            return Err(e);
-        }
         r.map_err(|e| ImportError(format!("{}: {e}", self.name)))
     }
 
@@ -397,8 +455,10 @@ struct Builder<'a> {
     resolver: &'a dyn ExternalResolver,
     /// Candidate lists of the constraint currently being built.
     pending_variants: Option<Vec<Constraint>>,
-    /// Coincident point pairs seen so far (for shared-endpoint tangency).
+    /// Coincident point pairs (pre-pass over all COINCIDENT constraints).
     coincident: Vec<(PointRef, PointRef)>,
+    /// Points lying on curves (pre-pass).
+    on_curve: Vec<(PointRef, EntId)>,
 }
 
 impl Builder<'_> {
@@ -406,14 +466,18 @@ impl Builder<'_> {
         match self.sketch.entities[e] {
             Entity::Point { .. } => "point",
             Entity::Line { .. } => "line",
-            Entity::Arc { .. } => "arc",
+            Entity::Arc { .. } | Entity::BulgeArc { .. } => "arc",
             Entity::Circle { .. } => "circle",
             Entity::Ellipse { .. } => "ellipse",
         }
     }
 
     fn is_circle(&self, e: EntId) -> bool {
-        matches!(self.sketch.entities[e], Entity::Arc { .. } | Entity::Circle { .. })
+        matches!(self.sketch.entities[e], Entity::Arc { .. } | Entity::BulgeArc { .. } | Entity::Circle { .. })
+    }
+
+    fn is_arc(&self, e: EntId) -> bool {
+        matches!(self.sketch.entities[e], Entity::Arc { .. } | Entity::BulgeArc { .. })
     }
 
     fn local_ref(&self, id: &str) -> Result<Ref, ImportError> {
@@ -493,22 +557,44 @@ impl Builder<'_> {
         best.1
     }
 
-    /// The shared point of two curves, if a coincidence constraint joins an
-    /// endpoint of each: returns (point on a, point on b).
+    /// All points coincident with `p` (transitively), including `p`.
+    fn coincident_class(&self, p: PointRef) -> Vec<PointRef> {
+        let mut class = vec![p];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (a, b) in &self.coincident {
+                if class.contains(a) && !class.contains(b) {
+                    class.push(*b);
+                    changed = true;
+                } else if class.contains(b) && !class.contains(a) {
+                    class.push(*a);
+                    changed = true;
+                }
+            }
+        }
+        class
+    }
+
+    /// The point where two curves meet, if an endpoint of one is coincident
+    /// with an endpoint of the other or lies on it (through any chain of
+    /// coincidences): returns (point on a, point on b), where the point on b
+    /// may be a's endpoint itself when b has no endpoint there.
     fn shared_endpoint(&self, a: EntId, b: EntId) -> Option<(PointRef, PointRef)> {
         let ends = |e: EntId| -> Vec<PointRef> {
             match self.sketch.entities[e] {
-                Entity::Line { .. } | Entity::Arc { .. } => vec![PointRef::Start(e), PointRef::End(e)],
+                Entity::Line { .. } | Entity::Arc { .. } | Entity::BulgeArc { .. } => vec![PointRef::Start(e), PointRef::End(e)],
                 _ => vec![],
             }
         };
-        let same = |p: PointRef, q: PointRef| p == q;
-        for (p, q) in &self.coincident {
-            for pa in ends(a) {
-                for pb in ends(b) {
-                    if (same(*p, pa) && same(*q, pb)) || (same(*p, pb) && same(*q, pa)) {
-                        return Some((pa, pb));
-                    }
+        for (x, y) in [(a, b), (b, a)] {
+            for px in ends(x) {
+                let class = self.coincident_class(px);
+                if let Some(py) = ends(y).into_iter().find(|py| class.contains(py)) {
+                    return Some(if x == a { (px, py) } else { (py, px) });
+                }
+                if self.on_curve.iter().any(|(p, c)| *c == y && class.contains(p)) {
+                    return Some(if x == a { (px, px) } else { (px, px) });
                 }
             }
         }
@@ -547,7 +633,7 @@ fn add_entity(b: &mut Builder, e: &Json) -> Result<(), ImportError> {
             // Parameters are angles from the circle's x direction; a clockwise
             // circle's parameter runs the other way.
             let (a0, a1) = if cw { (rot - t0, rot - t1) } else { (rot + t0, rot + t1) };
-            b.sketch.add_arc(c, r, a0, a1, !cw, false)
+            add_arc_entity(&mut b.sketch, c, r, a0, a1, !cw)
         }
         ("BTMSketchCurve", "BTCurveGeometryCircle") => {
             b.sketch.add_circle([f(gm, "xCenter")?, f(gm, "yCenter")?], f(gm, "radius")?, false)
@@ -560,6 +646,25 @@ fn add_entity(b: &mut Builder, e: &Json) -> Result<(), ImportError> {
     };
     b.entities.insert(id, ent);
     Ok(())
+}
+
+/// Arcs are stored as endpoints plus bulge unless the sweep is nearly a
+/// full turn (a "circle drawn as an arc"), which the bulge form cannot
+/// represent; those keep the centre / angle form.
+fn add_arc_entity(sk: &mut Sketch, c: [f64; 2], r: f64, a0: f64, a1: f64, ccw: bool) -> EntId {
+    let tau = std::f64::consts::TAU;
+    let mut sweep = (a1 - a0) % tau;
+    if ccw && sweep <= 0.0 {
+        sweep += tau;
+    } else if !ccw && sweep >= 0.0 {
+        sweep -= tau;
+    }
+    if sweep.abs() > 1.9 * std::f64::consts::PI {
+        return sk.add_arc(c, r, a0, a1, ccw, false);
+    }
+    let a = [c[0] + r * a0.cos(), c[1] + r * a0.sin()];
+    let b = [c[0] + r * a1.cos(), c[1] + r * a1.sin()];
+    sk.add_bulge_arc(a, b, sweep, false)
 }
 
 // ---------------------------------------------------------------- constraints
@@ -597,13 +702,10 @@ fn build_constraint(b: &mut Builder, c: &Json, scope: &dyn Scope) -> Result<Opti
                 "COINCIDENT" => {
                     let bb = one(b, &second)?;
                     let c = match (a, bb) {
-                        (Ref::Point(p), Ref::Point(q)) => {
-                            b.coincident.push((p, q));
-                            Constraint::Coincident(p, q)
-                        }
+                        (Ref::Point(p), Ref::Point(q)) => Constraint::Coincident(p, q),
                         (Ref::Point(p), Ref::Curve(e)) | (Ref::Curve(e), Ref::Point(p)) => match b.sketch.entities[e] {
                             Entity::Line { .. } => Constraint::PointOnLine(p, e),
-                            Entity::Arc { .. } | Entity::Circle { .. } => Constraint::PointOnCircle(p, e),
+                            Entity::Arc { .. } | Entity::BulgeArc { .. } | Entity::Circle { .. } => Constraint::PointOnCircle(p, e),
                             Entity::Ellipse { .. } => Constraint::PointOnEllipse(p, e),
                             Entity::Point { .. } => unreachable!(),
                         },
@@ -737,7 +839,7 @@ fn build_constraint(b: &mut Builder, c: &Json, scope: &dyn Scope) -> Result<Opti
                                     Constraint::PointLineDistance { point: p, line: e, sign: 1.0, value: v },
                                     Constraint::PointLineDistance { point: p, line: e, sign: -1.0, value: v },
                                 ]),
-                                Entity::Arc { .. } | Entity::Circle { .. } => b.best(vec![
+                                Entity::Arc { .. } | Entity::BulgeArc { .. } | Entity::Circle { .. } => b.best(vec![
                                     Constraint::PointCircleDistance { point: p, circle: e, sign: 1.0, value: v },
                                     Constraint::PointCircleDistance { point: p, circle: e, sign: -1.0, value: v },
                                 ]),
@@ -794,9 +896,10 @@ fn build_constraint(b: &mut Builder, c: &Json, scope: &dyn Scope) -> Result<Opti
                     (Ref::Point(m), Ref::Curve(l)) | (Ref::Curve(l), Ref::Point(m)) if matches!(b.sketch.entities[l], Entity::Line { .. }) => {
                         Constraint::Midpoint { mid: m, a: PointRef::Start(l), b: PointRef::End(l) }
                     }
-                    (Ref::Point(m), Ref::Curve(l)) | (Ref::Curve(l), Ref::Point(m)) if matches!(b.sketch.entities[l], Entity::Arc { .. }) => {
-                        Constraint::ArcMidpoint { point: m, arc: l }
-                    }
+                    (Ref::Point(m), Ref::Curve(l)) | (Ref::Curve(l), Ref::Point(m)) if b.is_arc(l) => b.best(vec![
+                        Constraint::ArcMidpoint { point: m, arc: l, far: false },
+                        Constraint::ArcMidpoint { point: m, arc: l, far: true },
+                    ]),
                     _ => return Err(ImportError(format!("MIDPOINT {p:?} / {q:?}"))),
                 },
                 other => return Err(ImportError(format!("MIDPOINT slots {other:?}"))),
@@ -824,9 +927,24 @@ pub fn import_sketch(feature: &Json, scope: &dyn Scope, resolver: &dyn ExternalR
         resolver,
         pending_variants: None,
         coincident: Vec::new(),
+        on_curve: Vec::new(),
     };
     for e in m["entities"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
         add_entity(&mut b, e).map_err(|err| ImportError(format!("{name}: {err}")))?;
+    }
+    // Pre-pass: coincidences and point-on-curve facts, so tangencies built
+    // earlier in the list can still find the meeting point.
+    for c in m["constraints"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        if msg(c)["constraintType"] != "COINCIDENT" {
+            continue;
+        }
+        let ps = params(msg(c));
+        let (Ok(Some((a, _))), Ok(Some((bb, _)))) = (b.slot(&ps, "localFirst", "externalFirst"), b.slot(&ps, "localSecond", "externalSecond")) else { continue };
+        match (a, bb) {
+            (Ref::Point(p), Ref::Point(q)) => b.coincident.push((p, q)),
+            (Ref::Point(p), Ref::Curve(e)) | (Ref::Curve(e), Ref::Point(p)) => b.on_curve.push((p, e)),
+            _ => {}
+        }
     }
     let mut dimensions = Vec::new();
     let mut skipped = Vec::new();

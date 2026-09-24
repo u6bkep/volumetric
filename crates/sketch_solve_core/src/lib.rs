@@ -30,6 +30,14 @@ pub enum Entity {
     Point { x: VarId, y: VarId },
     Line { ax: VarId, ay: VarId, bx: VarId, by: VarId },
     Arc { cx: VarId, cy: VarId, r: VarId, a0: VarId, a1: VarId, ccw: bool },
+    /// An arc by its endpoints and signed sagitta (the bow of the arc over
+    /// its chord, positive counter-clockwise). Centre and radius are
+    /// derived, so the arc passes smoothly through straight (sagitta 0) as
+    /// dimensions move, and the sagitta is a length, so the solver's
+    /// minimum-norm behaviour moves the bow by small distances rather than
+    /// swinging a flat arc's radius around. Use it for every arc whose sweep
+    /// is not near a full turn.
+    BulgeArc { ax: VarId, ay: VarId, bx: VarId, by: VarId, sag: VarId },
     Circle { cx: VarId, cy: VarId, r: VarId },
     /// `ra` along the direction `ang`, `rb` across it.
     Ellipse { cx: VarId, cy: VarId, ra: VarId, rb: VarId, ang: VarId },
@@ -87,8 +95,9 @@ pub enum Constraint {
     PointPointDistance { a: PointRef, b: PointRef, mode: DistanceMode, sign: f64, value: f64 },
     /// Signed perpendicular distance from a point to a line's infinite line.
     PointLineDistance { point: PointRef, line: EntId, sign: f64, value: f64 },
-    /// Distance between two (parallel) lines, measured from the midpoint of
-    /// the second to the first.
+    /// Distance between two lines: both endpoints of `b` at the signed
+    /// distance from `a`'s infinite line, which makes them parallel (as a
+    /// CAD line-line distance does).
     LineLineDistance { a: EntId, b: EntId, sign: f64, value: f64 },
     /// Distance from a point to a circle (`|p - c| - r`, signed by `sign`).
     PointCircleDistance { point: PointRef, circle: EntId, sign: f64, value: f64 },
@@ -118,9 +127,9 @@ pub enum Constraint {
     EllipseAxis { ellipse: EntId, horizontal: bool },
     /// `point` is the midpoint of `arc` in the CAD sense: on the arc's
     /// circle and on the perpendicular bisector of its chord. That has two
-    /// solutions (either side of the chord) and the solver keeps the one the
-    /// seed is on, which is how Onshape behaves too.
-    ArcMidpoint { point: PointRef, arc: EntId },
+    /// solutions and Onshape accepts either; `far` says the point is on the
+    /// opposite side of the chord from the arc (chosen from the seed).
+    ArcMidpoint { point: PointRef, arc: EntId, far: bool },
     /// Pin a variable to a value (used for fixed external geometry that must
     /// still be part of the system).
     FixVar { var: VarId, value: f64 },
@@ -135,6 +144,13 @@ pub struct Sketch {
     pub fixed: Vec<bool>,
     pub entities: Vec<Entity>,
     pub constraints: Vec<Constraint>,
+    /// Optional anchor: a weak pull of every free variable toward these
+    /// values with the given weight (rows `w (x - x0)` added to the least
+    /// squares, not counted in convergence). It decides under-constrained
+    /// degrees of freedom the way a CAD solver re-solving from its stored
+    /// sketch does: the solution closest to the seed, independent of the
+    /// path taken to reach the current dimensions.
+    pub anchor: Option<(Vec<f64>, f64)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -168,11 +184,16 @@ pub struct SolveOptions {
     /// Convergence tolerance on the largest residual (model units).
     pub tolerance: f64,
     pub initial_damping: f64,
+    /// Optional trust region: a step moving any variable by more than this
+    /// is rejected and the damping increased. Off by default: the variables
+    /// mix lengths and radians and under-constrained directions legitimately
+    /// take large steps, so a cap mostly just slows convergence.
+    pub max_step: f64,
 }
 
 impl Default for SolveOptions {
     fn default() -> Self {
-        SolveOptions { max_iterations: 100, tolerance: 1e-9, initial_damping: 1e-3 }
+        SolveOptions { max_iterations: 100, tolerance: 1e-7, initial_damping: 1e-3, max_step: f64::INFINITY }
     }
 }
 
@@ -223,6 +244,38 @@ impl Sketch {
         self.entities.len() - 1
     }
 
+    /// Arc from `a` to `b` with the given signed sweep (radians, positive
+    /// counter-clockwise), stored as endpoints plus sagitta.
+    pub fn add_bulge_arc(&mut self, a: [f64; 2], b: [f64; 2], sweep: f64, fixed: bool) -> EntId {
+        let ax = self.var(a[0], fixed);
+        let ay = self.var(a[1], fixed);
+        let bx = self.var(b[0], fixed);
+        let by = self.var(b[1], fixed);
+        let chord = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        let sag = self.var(sagitta_from_sweep(chord, sweep), fixed);
+        self.entities.push(Entity::BulgeArc { ax, ay, bx, by, sag });
+        self.entities.len() - 1
+    }
+
+    /// Set a bulge arc's sagitta from a signed sweep at its current chord.
+    pub fn set_arc_sweep(&mut self, e: EntId, sweep: f64) {
+        let Entity::BulgeArc { ax, ay, bx, by, sag } = self.entities[e] else { panic!("not a bulge arc") };
+        let chord = ((self.x[bx] - self.x[ax]).powi(2) + (self.x[by] - self.x[ay]).powi(2)).sqrt();
+        self.x[sag] = sagitta_from_sweep(chord, sweep);
+    }
+
+    /// Signed sweep of a bulge arc at its current values.
+    pub fn arc_sweep(&self, e: EntId) -> f64 {
+        let Entity::BulgeArc { ax, ay, bx, by, sag } = self.entities[e] else { panic!("not a bulge arc") };
+        let chord = ((self.x[bx] - self.x[ax]).powi(2) + (self.x[by] - self.x[ay]).powi(2)).sqrt();
+        4.0 * (2.0 * self.x[sag] / chord.max(1e-12)).atan()
+    }
+
+    /// Centre and radius of an arc or circle entity at the current values.
+    pub fn circle(&self, e: EntId) -> ([f64; 2], f64) {
+        circle_of::<f64>(self, e, &self.x)
+    }
+
     pub fn add_circle(&mut self, c: [f64; 2], r: f64, fixed: bool) -> EntId {
         let cx = self.var(c[0], fixed);
         let cy = self.var(c[1], fixed);
@@ -266,8 +319,8 @@ impl Sketch {
         let plain = |sk: &Sketch, p: PointRef| -> Option<(VarId, VarId)> {
             match (p, sk.entities[p.entity()]) {
                 (PointRef::Point(_), Entity::Point { x, y }) => Some((x, y)),
-                (PointRef::Start(_), Entity::Line { ax, ay, .. }) => Some((ax, ay)),
-                (PointRef::End(_), Entity::Line { bx, by, .. }) => Some((bx, by)),
+                (PointRef::Start(_), Entity::Line { ax, ay, .. }) | (PointRef::Start(_), Entity::BulgeArc { ax, ay, .. }) => Some((ax, ay)),
+                (PointRef::End(_), Entity::Line { bx, by, .. }) | (PointRef::End(_), Entity::BulgeArc { bx, by, .. }) => Some((bx, by)),
                 (PointRef::Center(_), Entity::Arc { cx, cy, .. })
                 | (PointRef::Center(_), Entity::Circle { cx, cy, .. })
                 | (PointRef::Center(_), Entity::Ellipse { cx, cy, .. }) => Some((cx, cy)),
@@ -321,6 +374,13 @@ impl Sketch {
                     m(a0);
                     m(a1);
                 }
+                Entity::BulgeArc { ax, ay, bx, by, sag } => {
+                    m(ax);
+                    m(ay);
+                    m(bx);
+                    m(by);
+                    m(sag);
+                }
                 Entity::Circle { cx, cy, r } => {
                     m(cx);
                     m(cy);
@@ -354,12 +414,61 @@ impl Sketch {
         remap
     }
 
+    /// Fix the sweep direction of bulge arcs from their tangent junctions:
+    /// where a curve ends and another starts (`TangentAt` with End/Start or
+    /// Start/End points) the tangents must point the same way, where both
+    /// start or both end they must oppose. An arc whose tangent has the
+    /// wrong sense is replaced by its complement (sweep -/+ 2π: the same
+    /// circle the other way round). Lines have a definite sense, so their
+    /// junctions are decided first and the result propagates through
+    /// arc-arc junctions; arcs joined only to other unconfirmed arcs (or to
+    /// circles) keep their seeded direction. Returns the number flipped.
+    pub fn fix_arc_sweeps(&mut self) -> usize {
+        let mut confirmed: Vec<bool> = self.entities.iter().map(|e| !matches!(e, Entity::BulgeArc { .. })).collect();
+        let mut flipped = 0;
+        loop {
+            let mut changed = false;
+            for i in 0..self.constraints.len() {
+                let Constraint::TangentAt { a, at_a, b, at_b } = self.constraints[i] else { continue };
+                if at_a.entity() != a || at_b.entity() != b {
+                    continue; // a foreign point (circle junction): no sense
+                }
+                let (known, unknown, at_k, at_u) = match (confirmed[a], confirmed[b]) {
+                    (true, false) => (a, b, at_a, at_b),
+                    (false, true) => (b, a, at_b, at_a),
+                    _ => continue,
+                };
+                if !matches!(self.entities[unknown], Entity::BulgeArc { .. }) {
+                    continue;
+                }
+                let is_start = |p: PointRef| matches!(p, PointRef::Start(_));
+                let same_sense = is_start(at_k) != is_start(at_u);
+                let tk = tangent_at::<f64>(self, known, at_k, &self.x);
+                let tu = tangent_at::<f64>(self, unknown, at_u, &self.x);
+                let d = tk[0] * tu[0] + tk[1] * tu[1];
+                if d != 0.0 && (d > 0.0) != same_sense {
+                    let sweep = self.arc_sweep(unknown);
+                    let sweep = if sweep > 0.0 { sweep - std::f64::consts::TAU } else { sweep + std::f64::consts::TAU };
+                    self.set_arc_sweep(unknown, sweep);
+                    flipped += 1;
+                }
+                confirmed[unknown] = true;
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+        flipped
+    }
+
     /// Variables an entity is made of.
     pub fn entity_vars(&self, e: EntId) -> Vec<VarId> {
         match self.entities[e] {
             Entity::Point { x, y } => vec![x, y],
             Entity::Line { ax, ay, bx, by } => vec![ax, ay, bx, by],
             Entity::Arc { cx, cy, r, a0, a1, .. } => vec![cx, cy, r, a0, a1],
+            Entity::BulgeArc { ax, ay, bx, by, sag } => vec![ax, ay, bx, by, sag],
             Entity::Circle { cx, cy, r } => vec![cx, cy, r],
             Entity::Ellipse { cx, cy, ra, rb, ang } => vec![cx, cy, ra, rb, ang],
         }
@@ -378,6 +487,21 @@ impl Sketch {
     /// Residuals of one constraint (one or two numbers, length units).
     pub fn constraint_residuals(&self, i: usize) -> Vec<f64> {
         residuals_of::<f64>(self, &self.constraints[i], &self.x)
+    }
+
+    /// Analytic Jacobian rows of one constraint: for each variable it
+    /// depends on, the derivative of each of its residuals.
+    pub fn constraint_jacobian(&self, i: usize) -> Vec<(VarId, Vec<f64>)> {
+        let c = &self.constraints[i];
+        let mut xd: Vec<Dual> = self.x.iter().map(|&v| Dual::c(v)).collect();
+        let mut out = Vec::new();
+        for v in self.constraint_vars(c) {
+            xd[v] = Dual::var(self.x[v]);
+            let rd = residuals_of::<Dual>(self, c, &xd);
+            xd[v] = Dual::c(self.x[v]);
+            out.push((v, rd.iter().map(|d| d.d).collect()));
+        }
+        out
     }
 
     /// All residuals in constraint order.
@@ -470,7 +594,7 @@ impl Sketch {
                 v.push(a);
                 v.push(b);
             }
-            Constraint::ArcMidpoint { point, arc } => {
+            Constraint::ArcMidpoint { point, arc, .. } => {
                 pr(point);
                 v.push(arc);
             }
@@ -492,6 +616,9 @@ fn point_of<T: Real>(sk: &Sketch, p: PointRef, x: &[T]) -> [T; 2] {
         (PointRef::End(_), Entity::Line { bx, by, .. }) => [x[bx], x[by]],
         (PointRef::Start(_), Entity::Arc { cx, cy, r, a0, .. }) => [x[cx] + x[r] * x[a0].cos(), x[cy] + x[r] * x[a0].sin()],
         (PointRef::End(_), Entity::Arc { cx, cy, r, a1, .. }) => [x[cx] + x[r] * x[a1].cos(), x[cy] + x[r] * x[a1].sin()],
+        (PointRef::Start(_), Entity::BulgeArc { ax, ay, .. }) => [x[ax], x[ay]],
+        (PointRef::End(_), Entity::BulgeArc { bx, by, .. }) => [x[bx], x[by]],
+        (PointRef::Center(_), Entity::BulgeArc { .. }) => bulge_center::<T>(sk, p.entity(), x).0,
         (PointRef::Center(_), Entity::Arc { cx, cy, .. })
         | (PointRef::Center(_), Entity::Circle { cx, cy, .. })
         | (PointRef::Center(_), Entity::Ellipse { cx, cy, .. }) => [x[cx], x[cy]],
@@ -511,8 +638,68 @@ fn line_of<T: Real>(sk: &Sketch, e: EntId, x: &[T]) -> ([T; 2], [T; 2]) {
 fn circle_of<T: Real>(sk: &Sketch, e: EntId, x: &[T]) -> ([T; 2], T) {
     match sk.entities[e] {
         Entity::Arc { cx, cy, r, .. } | Entity::Circle { cx, cy, r } => ([x[cx], x[cy]], x[r]),
+        Entity::BulgeArc { .. } => bulge_center::<T>(sk, e, x),
         other => panic!("entity {e} is not a circle or arc: {other:?}"),
     }
+}
+
+/// Centre and (positive) radius of a bulge arc. With chord length L and
+/// bulge b: R = L (1 + b²) / (4 |b|); the centre sits at
+/// (L / 2)(1 - b²) / (2 b) to the left of the chord's midpoint (negative
+/// = right). Singular at b = 0 (a straight arc has no centre); callers
+/// that need the centre only use it for arcs that are never straight.
+/// Sagitta of an arc with chord `chord` and signed sweep: s = (L/2) tan(sweep/4).
+pub fn sagitta_from_sweep(chord: f64, sweep: f64) -> f64 {
+    chord * 0.5 * (sweep / 4.0).tan()
+}
+
+/// Bulge tan(sweep/4) of a bulge arc at values `x`: 2 s / L.
+fn bulge_of<T: Real>(sk: &Sketch, e: EntId, x: &[T]) -> T {
+    let Entity::BulgeArc { ax, ay, bx, by, sag } = sk.entities[e] else { panic!("not a bulge arc") };
+    let l = norm(dir([x[ax], x[ay]], [x[bx], x[by]]));
+    x[sag] * T::c(2.0) / longer(l, T::c(1e-12))
+}
+
+fn bulge_center<T: Real>(sk: &Sketch, e: EntId, x: &[T]) -> ([T; 2], T) {
+    let Entity::BulgeArc { ax, ay, bx, by, .. } = sk.entities[e] else { panic!("not a bulge arc") };
+    let (a, b) = ([x[ax], x[ay]], [x[bx], x[by]]);
+    let c = dir(a, b);
+    let l = norm(c);
+    let bl = bulge_of::<T>(sk, e, x);
+    let mid = [(a[0] + b[0]) * T::c(0.5), (a[1] + b[1]) * T::c(0.5)];
+    let left = [-c[1] / longer(l, T::c(1e-12)), c[0] / longer(l, T::c(1e-12))];
+    let two_b = bl * T::c(2.0);
+    let two_b = if two_b.val().abs() < 1e-12 { T::c(1e-12) } else { two_b };
+    let d = l * T::c(0.5) * (T::c(1.0) - bl * bl) / two_b;
+    let r = l * (T::c(1.0) + bl * bl) / (two_b * T::c(2.0));
+    ([mid[0] + left[0] * d, mid[1] + left[1] * d], r.abs())
+}
+
+/// The other intersection of the chord's bisector with the arc's circle:
+/// at distance L² / (4 s) from the chord midpoint on the side opposite the
+/// arc (the two bisector segments of the diameter multiply to (L/2)²).
+fn bulge_far_point<T: Real>(sk: &Sketch, e: EntId, x: &[T]) -> [T; 2] {
+    let Entity::BulgeArc { ax, ay, bx, by, sag } = sk.entities[e] else { panic!("not a bulge arc") };
+    let (a, b) = ([x[ax], x[ay]], [x[bx], x[by]]);
+    let c = dir(a, b);
+    let l = longer(norm(c), T::c(1e-12));
+    let mid = [(a[0] + b[0]) * T::c(0.5), (a[1] + b[1]) * T::c(0.5)];
+    let sag = if x[sag].val().abs() < 1e-12 { T::c(1e-12) } else { x[sag] };
+    // offset along -left normal is +s for the near point; the far point is at -(L²/(4s)) along the same direction
+    let t = -(l * l) / (sag * T::c(4.0)) / l;
+    [mid[0] + c[1] * t, mid[1] - c[0] * t]
+}
+
+/// Point at the middle of a bulge arc: chord midpoint minus the left unit
+/// normal times the sagitta. Smooth through straight.
+fn bulge_midpoint<T: Real>(sk: &Sketch, e: EntId, x: &[T]) -> [T; 2] {
+    let Entity::BulgeArc { ax, ay, bx, by, sag } = sk.entities[e] else { panic!("not a bulge arc") };
+    let (a, b) = ([x[ax], x[ay]], [x[bx], x[by]]);
+    let c = dir(a, b);
+    let l = longer(norm(c), T::c(1e-12));
+    let mid = [(a[0] + b[0]) * T::c(0.5), (a[1] + b[1]) * T::c(0.5)];
+    let s = x[sag] / l;
+    [mid[0] + c[1] * s, mid[1] - c[0] * s]
 }
 
 /// Tangent direction of a curve at one of its points (unnormalised). For a
@@ -521,13 +708,38 @@ fn circle_of<T: Real>(sk: &Sketch, e: EntId, x: &[T]) -> ([T; 2], T) {
 fn tangent_at<T: Real>(sk: &Sketch, e: EntId, at: PointRef, x: &[T]) -> [T; 2] {
     match sk.entities[e] {
         Entity::Line { ax, ay, bx, by } => [x[bx] - x[ax], x[by] - x[ay]],
-        Entity::Arc { a0, a1, .. } => {
+        Entity::Arc { cx, cy, a0, a1, .. } => {
+            if at.entity() != e {
+                let p = point_of::<T>(sk, at, x);
+                return [-(p[1] - x[cy]), p[0] - x[cx]];
+            }
             let a = match at {
                 PointRef::Start(_) => x[a0],
                 PointRef::End(_) => x[a1],
                 other => panic!("tangent of an arc at {other:?}"),
             };
             [-a.sin(), a.cos()]
+        }
+        Entity::BulgeArc { ax, ay, bx, by, .. } => {
+            if at.entity() != e {
+                // A point of another entity lying on this arc: perpendicular
+                // to the radius (needs the centre, so not for straight arcs).
+                let (c, _) = bulge_center::<T>(sk, e, x);
+                let p = point_of::<T>(sk, at, x);
+                return [-(p[1] - c[1]), p[0] - c[0]];
+            }
+            // Rotate the chord by -sweep/2 at the start, +sweep/2 at the end;
+            // cos(sweep/2) = (1 - b²)/(1 + b²), sin(sweep/2) = 2b/(1 + b²).
+            let c = [x[bx] - x[ax], x[by] - x[ay]];
+            let b = bulge_of::<T>(sk, e, x);
+            let den = T::c(1.0) + b * b;
+            let (cs, sn) = ((T::c(1.0) - b * b) / den, b * T::c(2.0) / den);
+            let sn = match at {
+                PointRef::Start(_) => -sn,
+                PointRef::End(_) => sn,
+                other => panic!("tangent of an arc at {other:?}"),
+            };
+            [c[0] * cs - c[1] * sn, c[0] * sn + c[1] * cs]
         }
         Entity::Circle { cx, cy, .. } => {
             let p = point_of::<T>(sk, at, x);
@@ -577,6 +789,14 @@ fn line_signed_distance<T: Real>(p: [T; 2], a: [T; 2], b: [T; 2]) -> T {
     cross(d, dir(a, p)) / norm(d)
 }
 
+/// Signed distance of `p` from line `a b` times the line's length over
+/// ANGLE_SCALE: equal to the distance for a line of length ANGLE_SCALE,
+/// weaker for shorter lines, and smooth when the line collapses.
+fn line_weighted_distance<T: Real>(p: [T; 2], a: [T; 2], b: [T; 2]) -> T {
+    let d = dir(a, b);
+    cross(d, dir(a, p)) / T::c(ANGLE_SCALE)
+}
+
 fn residuals_of<T: Real>(sk: &Sketch, c: &Constraint, x: &[T]) -> Vec<T> {
     let pt = |p: PointRef| point_of::<T>(sk, p, x);
     let ln = |e: EntId| line_of::<T>(sk, e, x);
@@ -587,9 +807,12 @@ fn residuals_of<T: Real>(sk: &Sketch, c: &Constraint, x: &[T]) -> Vec<T> {
             let (p, q) = (pt(a), pt(b));
             vec![p[0] - q[0], p[1] - q[1]]
         }
+        // Point-on-line and collinearity are weighted by the line's length
+        // relative to ANGLE_SCALE (cross product / reference length) so a
+        // collapsing line does not make the condition violently nonlinear.
         Constraint::PointOnLine(p, e) => {
             let (a, b) = ln(e);
-            vec![line_signed_distance(pt(p), a, b)]
+            vec![line_weighted_distance(pt(p), a, b)]
         }
         Constraint::PointOnCircle(p, e) => {
             let (c, r) = ci(e);
@@ -609,7 +832,7 @@ fn residuals_of<T: Real>(sk: &Sketch, c: &Constraint, x: &[T]) -> Vec<T> {
         Constraint::Collinear(a, b) => {
             let (p, q) = ln(a);
             let (s, t) = ln(b);
-            vec![line_signed_distance(s, p, q), line_signed_distance(t, p, q)]
+            vec![line_weighted_distance(s, p, q), line_weighted_distance(t, p, q)]
         }
         Constraint::HorizontalLine(e) => {
             let (a, b) = ln(e);
@@ -657,8 +880,7 @@ fn residuals_of<T: Real>(sk: &Sketch, c: &Constraint, x: &[T]) -> Vec<T> {
         Constraint::LineLineDistance { a, b, sign, value } => {
             let (p, q) = ln(a);
             let (s, t) = ln(b);
-            let m = [(s[0] + t[0]) * k(0.5), (s[1] + t[1]) * k(0.5)];
-            vec![line_signed_distance(m, p, q) * k(sign) - k(value)]
+            vec![line_signed_distance(s, p, q) * k(sign) - k(value), line_signed_distance(t, p, q) * k(sign) - k(value)]
         }
         Constraint::PointCircleDistance { point, circle, sign, value } => {
             let (c, r) = ci(circle);
@@ -705,18 +927,25 @@ fn residuals_of<T: Real>(sk: &Sketch, c: &Constraint, x: &[T]) -> Vec<T> {
             vec![(phi - k(target + corr)) * k(ANGLE_SCALE)]
         }
         Constraint::TangentAt { a, at_a, b, at_b } => {
-            // Soft-normalised tangents: a line shorter than 1 nm has no
-            // direction and the condition becomes vacuous.
+            // Arc tangents are unit vectors, a line's tangent has its length:
+            // the cross product over the longer of the two (or ANGLE_SCALE)
+            // weights the condition by the shorter length, so a collapsing
+            // line's tangency fades smoothly.
             let ta = tangent_at::<T>(sk, a, at_a, x);
             let tb = tangent_at::<T>(sk, b, at_b, x);
-            let (na, nb) = (longer(norm(ta), k(1e-9)), longer(norm(tb), k(1e-9)));
-            vec![cross([ta[0] / na, ta[1] / na], [tb[0] / nb, tb[1] / nb]) * k(ANGLE_SCALE)]
+            let m = longer(longer(norm(ta), norm(tb)), k(ANGLE_SCALE));
+            vec![cross(ta, tb) / m * k(ANGLE_SCALE)]
         }
         Constraint::EllipseAxis { ellipse, horizontal } => {
             let Entity::Ellipse { ra, ang, .. } = sk.entities[ellipse] else { panic!("not an ellipse") };
             vec![x[ra] * if horizontal { x[ang].sin() } else { x[ang].cos() }]
         }
-        Constraint::ArcMidpoint { point, arc } => {
+        Constraint::ArcMidpoint { point, arc, far } if matches!(sk.entities[arc], Entity::BulgeArc { .. }) => {
+            let p = pt(point);
+            let m = if far { bulge_far_point::<T>(sk, arc, x) } else { bulge_midpoint::<T>(sk, arc, x) };
+            vec![p[0] - m[0], p[1] - m[1]]
+        }
+        Constraint::ArcMidpoint { point, arc, .. } => {
             let Entity::Arc { cx, cy, r, .. } = sk.entities[arc] else { panic!("not an arc") };
             let p = pt(point);
             let s = pt(PointRef::Start(arc));
@@ -754,7 +983,7 @@ pub fn solve(sk: &mut Sketch, opts: SolveOptions) -> Result<SolveReport, SolveEr
     if n == 0 {
         return Ok(SolveReport { converged: worst <= opts.tolerance, iterations: 0, max_residual: worst, worst_constraint: worst_i, free_vars: 0, equations, progress: 1.0 });
     }
-    let mut cost = sum_sq(&sk.residuals());
+    let mut cost = total_cost(sk);
     let sparse = n > dense_limit();
     while worst > opts.tolerance && iterations < opts.max_iterations {
         iterations += 1;
@@ -776,6 +1005,16 @@ pub fn solve(sk: &mut Sketch, opts: SolveOptions) -> Result<SolveReport, SolveEr
                 rows.push((r0[k], cols.iter().map(|(c, d)| (*c, d[k])).collect()));
             }
         }
+        if std::env::var("SKETCH_TRACE").is_ok_and(|v| v == "2") {
+            let bad: Vec<usize> = rows.iter().enumerate().filter(|(_, (r, cols))| !r.is_finite() || cols.iter().any(|(_, d)| !d.is_finite())).map(|(i, _)| i).collect();
+            let maxd = rows.iter().flat_map(|(_, c)| c.iter().map(|(_, d)| d.abs())).fold(0.0f64, f64::max);
+            eprintln!("    jacobian: {} rows, {} non-finite rows {:?}, max |d| {maxd:.2e}, cost {cost:.3e}", rows.len(), bad.len(), &bad[..bad.len().min(5)]);
+        }
+        if let Some((x0, w)) = &sk.anchor {
+            for (c, &v) in free.iter().enumerate() {
+                rows.push((w * (sk.x[v] - x0[v]), vec![(c, *w)]));
+            }
+        }
         // g = Jᵀr and the diagonal of JᵀJ; the full dense JᵀJ only when small.
         let mut g = vec![0.0; n];
         let mut diag = vec![0.0; n];
@@ -785,6 +1024,14 @@ pub fn solve(sk: &mut Sketch, opts: SolveOptions) -> Result<SolveReport, SolveEr
                 diag[*c] += d * d;
             }
         }
+        // No free variable influences any residual: nothing to do.
+        if g.iter().all(|v| v.abs() < 1e-20) {
+            break;
+        }
+        // Under-constrained sketches have near-null directions where the
+        // curvature is ~0 and the gradient is rounding noise; a small absolute
+        // Tikhonov term (NULL_DAMPING, independent of lambda) keeps their
+        // steps tiny without slowing the well-conditioned directions.
         let mut a = Vec::new();
         if !sparse {
             a = vec![0.0; n * n];
@@ -798,14 +1045,14 @@ pub fn solve(sk: &mut Sketch, opts: SolveOptions) -> Result<SolveReport, SolveEr
         }
         // Try steps with increasing damping until the cost drops.
         let mut accepted = false;
-        for _ in 0..12 {
+        for _ in 0..20 {
             let rhs: Vec<f64> = g.iter().map(|v| -v).collect();
             let delta = if sparse {
                 pcg_normal(&rows, &diag, lambda, &rhs, n)
             } else {
                 let mut m = a.clone();
                 for i in 0..n {
-                    m[i * n + i] += lambda * diag[i].max(1e-12) + 1e-14;
+                    m[i * n + i] += lambda * diag[i].max(1e-12) + NULL_DAMPING;
                 }
                 cholesky_solve(&mut m, n, &rhs)
             };
@@ -813,19 +1060,26 @@ pub fn solve(sk: &mut Sketch, opts: SolveOptions) -> Result<SolveReport, SolveEr
                 lambda *= 10.0;
                 continue;
             };
+            if delta.iter().any(|d| d.abs() > opts.max_step || !d.is_finite()) {
+                lambda *= 10.0;
+                continue;
+            }
             let saved = sk.x.clone();
             for (c, &v) in free.iter().enumerate() {
                 sk.x[v] += delta[c];
             }
-            let new_cost = sum_sq(&sk.residuals());
+            let new_cost = total_cost(sk);
+            if std::env::var("SKETCH_TRACE").is_ok_and(|v| v == "2") {
+                eprintln!("    iter {iterations} lambda {lambda:.1e} cost {cost:.3e} -> {new_cost:.3e} step {:.2e}", delta.iter().map(|d| d.abs()).fold(0.0f64, f64::max));
+            }
             if new_cost.is_finite() && new_cost < cost {
                 cost = new_cost;
-                lambda = (lambda / 3.0).max(1e-12);
+                lambda = (lambda / 10.0).max(1e-15);
                 accepted = true;
                 break;
             }
             sk.x = saved;
-            lambda *= 4.0;
+            lambda *= 10.0;
         }
         let (w, wi) = sk.worst_residual();
         worst = w;
@@ -888,16 +1142,21 @@ pub fn solve_continuation(
     Ok(r)
 }
 
+/// Absolute damping added to every diagonal entry of the normal matrix (in
+/// the units of JᵀJ, i.e. residual² per variable²; residuals and variables
+/// are both in model length units or radians).
+const NULL_DAMPING: f64 = 1e-12;
+
 /// Systems with more free variables than this use the sparse path.
 fn dense_limit() -> usize {
-    std::env::var("SKETCH_DENSE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(150)
+    std::env::var("SKETCH_DENSE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 /// Preconditioned conjugate gradients on (JᵀJ + λ diag) δ = rhs with J given
 /// as sparse rows. Jacobi preconditioning; returns `None` if it fails to make
 /// progress.
 fn pcg_normal(rows: &[(f64, Vec<(usize, f64)>)], diag: &[f64], lambda: f64, rhs: &[f64], n: usize) -> Option<Vec<f64>> {
-    let damp: Vec<f64> = diag.iter().map(|d| lambda * d.max(1e-12) + 1e-14).collect();
+    let damp: Vec<f64> = diag.iter().map(|d| lambda * d.max(1e-12) + NULL_DAMPING).collect();
     let apply = |p: &[f64], out: &mut Vec<f64>| {
         for (o, (pi, di)) in out.iter_mut().zip(p.iter().zip(&damp)) {
             *o = pi * di;
@@ -925,10 +1184,14 @@ fn pcg_normal(rows: &[(f64, Vec<(usize, f64)>)], diag: &[f64], lambda: f64, rhs:
         return Some(x);
     }
     let mut ap = vec![0.0; n];
-    for _ in 0..(4 * n).max(50) {
+    // Inexact solves are fine for a damped step; cap the work per solve.
+    for _ in 0..(2 * n).clamp(50, 2000) {
         apply(&p, &mut ap);
         let pap: f64 = p.iter().zip(&ap).map(|(a, b)| a * b).sum();
         if pap <= 0.0 || !pap.is_finite() {
+            if std::env::var("SKETCH_TRACE").is_ok_and(|v| v == "2") {
+                eprintln!("    pcg stop: pAp {pap:.3e} rhs norm {rhs_norm:.3e}");
+            }
             break;
         }
         let alpha = rz / pap;
@@ -955,6 +1218,19 @@ fn pcg_normal(rows: &[(f64, Vec<(usize, f64)>)], diag: &[f64], lambda: f64, rhs:
 
 fn sum_sq(r: &[f64]) -> f64 {
     r.iter().map(|v| v * v).sum()
+}
+
+/// Least-squares cost including the anchor rows.
+fn total_cost(sk: &Sketch) -> f64 {
+    let mut c = sum_sq(&sk.residuals());
+    if let Some((x0, w)) = &sk.anchor {
+        for v in 0..sk.x.len() {
+            if !sk.fixed[v] {
+                c += (w * (sk.x[v] - x0[v])).powi(2);
+            }
+        }
+    }
+    c
 }
 
 /// In-place Cholesky solve of the symmetric positive definite `m` (n×n, row
@@ -1003,7 +1279,8 @@ mod tests {
     use super::*;
 
     fn solved(sk: &mut Sketch) -> SolveReport {
-        let r = solve(sk, SolveOptions::default()).unwrap();
+        // The tests work at unit scale, so allow unit-scale steps.
+        let r = solve(sk, SolveOptions { tolerance: 1e-11, ..Default::default() }).unwrap();
         assert!(r.converged, "did not converge: {r:?}");
         r
     }

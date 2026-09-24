@@ -245,6 +245,26 @@ pub fn apply_seed(imp: &mut SketchImport, ents: &[Entity3d], frame: &Frame, flip
                 sk.x[a0] = s0;
                 sk.x[a1] = s0 + sweep;
             }
+            (Entity::BulgeArc { ax, ay, bx, by, .. }, Geom3d::Arc { center, start, end, clockwise, .. }) => {
+                let (start, end) = (end_point(&id, "start", *start), end_point(&id, "end", *end));
+                let ccw = (!*clockwise) != flip_arcs;
+                let c = frame.to_2d(*center);
+                let (p, q) = (frame.to_2d(start), frame.to_2d(end));
+                let s0 = angle_of(c, p);
+                let s1 = angle_of(c, q);
+                let tau = std::f64::consts::TAU;
+                let mut sweep = (s1 - s0) % tau;
+                if ccw && sweep <= 0.0 {
+                    sweep += tau;
+                } else if !ccw && sweep >= 0.0 {
+                    sweep -= tau;
+                }
+                sk.x[ax] = p[0];
+                sk.x[ay] = p[1];
+                sk.x[bx] = q[0];
+                sk.x[by] = q[1];
+                sk.set_arc_sweep(e, sweep);
+            }
             (Entity::Circle { cx, cy, r }, Geom3d::Circle { center, radius }) => {
                 let c = frame.to_2d(*center);
                 sk.x[cx] = c[0];
@@ -263,6 +283,7 @@ pub fn apply_seed(imp: &mut SketchImport, ents: &[Entity3d], frame: &Frame, flip
             _ => missing.push(id),
         }
     }
+    imp.sketch.fix_arc_sweeps();
     missing
 }
 
@@ -290,7 +311,7 @@ fn internal_residual(imp: &SketchImport) -> f64 {
             Constraint::Radius { circle, .. } => vec![circle],
             Constraint::EllipseRadius { ellipse, .. } | Constraint::EllipseAxis { ellipse, .. } => vec![ellipse],
             Constraint::Angle { a, b, .. } | Constraint::TangentAt { a, b, .. } => vec![a, b],
-            Constraint::ArcMidpoint { point, arc } => vec![point.entity(), arc],
+            Constraint::ArcMidpoint { point, arc, .. } => vec![point.entity(), arc],
             Constraint::FixVar { var, .. } => return sk.fixed[var],
         };
         ents.iter().any(|&e| sk.entity_vars(e).iter().any(|&v| sk.fixed[v]))
