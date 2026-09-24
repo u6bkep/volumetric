@@ -1,0 +1,10 @@
+[package]
+name = "onshape_import_core"
+version = "0.1.0"
+edition = "2024"
+description = "Onshape Features API JSON -> sketch_solve_core sketches with fs_expr dimension expressions"
+
+[dependencies]
+serde_json = "1"
+fs_expr = { path = "../fs_expr" }
+sketch_solve_core = { path = "../sketch_solve_core" }

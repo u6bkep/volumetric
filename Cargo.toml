@@ -133,6 +133,9 @@ members = [
     "crates/volumetric_daemon",
     "crates/meshing_lab",
     "crates/wasm_dist",
+    "crates/fs_expr",
+    "crates/sketch_solve_core",
+    "crates/onshape_import_core",
 ]
 
 [features]

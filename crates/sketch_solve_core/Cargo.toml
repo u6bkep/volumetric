@@ -1,0 +1,7 @@
+[package]
+name = "sketch_solve_core"
+version = "0.1.0"
+edition = "2024"
+description = "2D sketch constraint solver: points, lines, arcs, circles, ellipses under CAD-style constraints, solved by Levenberg-Marquardt from a seed"
+
+[dependencies]

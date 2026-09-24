@@ -1,0 +1,7 @@
+[package]
+name = "fs_expr"
+version = "0.1.0"
+edition = "2024"
+description = "Evaluator for the Onshape FeatureScript expression subset used in feature parameters"
+
+[dependencies]
