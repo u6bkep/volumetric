@@ -1905,6 +1905,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs_expr"
+version = "0.1.0"
+
+[[package]]
 name = "full_moon"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3991,6 +3995,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "onshape_import_core"
+version = "0.1.0"
+dependencies = [
+ "fs_expr",
+ "serde_json",
+ "sketch_solve_core",
+]
+
+[[package]]
 name = "open"
 version = "5.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5211,6 +5224,10 @@ name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+
+[[package]]
+name = "sketch_solve_core"
+version = "0.1.0"
 
 [[package]]
 name = "skrifa"
