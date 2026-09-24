@@ -276,6 +276,27 @@ impl Sketch {
         circle_of::<f64>(self, e, &self.x)
     }
 
+    /// The point in the middle of an arc (either representation).
+    pub fn arc_midpoint(&self, e: EntId) -> [f64; 2] {
+        match self.entities[e] {
+            Entity::BulgeArc { .. } => bulge_midpoint::<f64>(self, e, &self.x),
+            Entity::Arc { cx, cy, r, a0, a1, .. } => {
+                let am = 0.5 * (self.x[a0] + self.x[a1]);
+                [self.x[cx] + self.x[r] * am.cos(), self.x[cy] + self.x[r] * am.sin()]
+            }
+            _ => panic!("not an arc"),
+        }
+    }
+
+    /// Sign of an arc's sweep (+1 counter-clockwise, -1 clockwise).
+    pub fn arc_sweep_sign(&self, e: EntId) -> f64 {
+        match self.entities[e] {
+            Entity::BulgeArc { sag, .. } => self.x[sag].signum(),
+            Entity::Arc { a0, a1, .. } => (self.x[a1] - self.x[a0]).signum(),
+            _ => 1.0,
+        }
+    }
+
     pub fn add_circle(&mut self, c: [f64; 2], r: f64, fixed: bool) -> EntId {
         let cx = self.var(c[0], fixed);
         let cy = self.var(c[1], fixed);
