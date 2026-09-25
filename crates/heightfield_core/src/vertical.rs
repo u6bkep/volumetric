@@ -113,7 +113,7 @@ mod tests {
     fn pocket_corners_round_off() {
         let grid = Grid::covering(0.0, 0.0, 20.0, 20.0, 0.25, 2);
         let mut s = Solid::empty(grid.clone());
-        let slab = Prism { region: rect_region(0.0, 0.0, 20.0, 20.0), origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], dir: [0.0, 0.0, 1.0], w0: 0.0, w1: 4.0 };
+        let slab = Prism { region: rect_region(0.0, 0.0, 20.0, 20.0), origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], dir: [0.0, 0.0, 1.0], w0: 0.0, w1: 4.0, label: None };
         s.extrude(&slab, Op::Add, 16, 1);
         let pocket = Prism { region: rect_region(5.0, 5.0, 15.0, 15.0), w0: 3.0, w1: 4.0, ..slab };
         s.extrude(&pocket, Op::Remove, 32, 2);

@@ -113,31 +113,39 @@ impl Region {
 
     /// Parameter intervals `(s0, s1)` of the line `o + s d` inside the region.
     pub fn line_intervals(&self, o: P2, d: P2) -> Vec<(f64, f64)> {
-        let mut ss: Vec<f64> = Vec::new();
-        for q in self.pieces() {
+        self.line_intervals_with(o, d).into_iter().map(|(a, b, _, _)| (a, b)).collect()
+    }
+
+    /// The intervals of the line `o + s d` inside the region, each with the
+    /// index (in `pieces()` order) of the boundary piece crossed at its
+    /// start and at its end.
+    pub fn line_intervals_with(&self, o: P2, d: P2) -> Vec<(f64, f64, usize, usize)> {
+        let mut ss: Vec<(f64, usize)> = Vec::new();
+        for (qi, q) in self.pieces().enumerate() {
             for (s, _) in q.curve.line_hits(o, d) {
-                ss.push(s);
+                ss.push((s, qi));
             }
         }
         if ss.is_empty() {
             return Vec::new();
         }
-        ss.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ss.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let dn = norm(d).max(1e-300);
-        let mut out: Vec<(f64, f64)> = Vec::new();
+        let mut out: Vec<(f64, f64, usize, usize)> = Vec::new();
         for w in ss.windows(2) {
-            if (w[1] - w[0]) * dn < 1e-12 {
+            if (w[1].0 - w[0].0) * dn < 1e-12 {
                 continue;
             }
-            let mid = add(o, scale(d, 0.5 * (w[0] + w[1])));
+            let mid = add(o, scale(d, 0.5 * (w[0].0 + w[1].0)));
             if self.contains(mid) {
                 if let Some(last) = out.last_mut() {
-                    if (w[0] - last.1).abs() * dn < 1e-9 {
-                        last.1 = w[1];
+                    if (w[0].0 - last.1).abs() * dn < 1e-9 {
+                        last.1 = w[1].0;
+                        last.3 = w[1].1;
                         continue;
                     }
                 }
-                out.push((w[0], w[1]));
+                out.push((w[0].0, w[1].0, w[0].1, w[1].1));
             }
         }
         out

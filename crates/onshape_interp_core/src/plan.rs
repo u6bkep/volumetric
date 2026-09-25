@@ -34,7 +34,17 @@ pub struct RegionSel {
     pub pick: Option<usize>,
     /// A wall face of an extrude along this region's boundary entity
     /// (`extrude feature, entity id, t0, t1`) instead of the region itself.
-    pub wall: Option<(String, String, f64, f64)>,
+    pub wall: Option<WallSel>,
+}
+
+/// A wall face of an extrude used as a loft profile (see `Ref::WallFace`).
+#[derive(Clone, Debug)]
+pub struct WallSel {
+    pub extrude: String,
+    pub entity: String,
+    pub t0: f64,
+    pub t1: f64,
+    pub ends: Option<[[f64; 3]; 2]>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +56,8 @@ pub struct EdgeSel {
     /// Bounding box of the blend face at the resolved configuration
     /// (model frame, metres): edge cells are taken from around it.
     pub hint_box: Option<[f64; 6]>,
+    /// The blend face's rails (see `EdgeRef::rails`).
+    pub rails: Option<Vec<[[f64; 3]; 3]>>,
 }
 
 #[derive(Clone, Debug)]
@@ -266,7 +278,7 @@ impl Resolver<'_> {
             for (ii, id) in ids.iter().enumerate() {
                 match self.get(param, qi + q_offset, ii, id) {
                     Some(Ref::Region { sketch, ids, pick }) => out.push(RegionSel { sketch, ids, pick, wall: None }),
-                    Some(Ref::WallFace { extrude, sketch, ids, pick, entity, t0, t1 }) => out.push(RegionSel { sketch, ids, pick, wall: Some((extrude, entity, t0, t1)) }),
+                    Some(Ref::WallFace { extrude, sketch, ids, pick, entity, t0, t1, ends }) => out.push(RegionSel { sketch, ids, pick, wall: Some(WallSel { extrude, entity, t0, t1, ends }) }),
                     Some(_) => self.unresolved.push(format!("{id} (not a region)")),
                     None => {}
                 }
@@ -292,13 +304,13 @@ impl Resolver<'_> {
         if let Some(list) = self.table.edges.get(&self.feature) {
             return list
                 .iter()
-                .map(|e| EdgeSel { a: e.a.clone(), b: e.b.clone(), side: e.side, hint: None, hint_box: e.hint_box })
+                .map(|e| EdgeSel { a: e.a.clone(), b: e.b.clone(), side: e.side, hint: None, hint_box: e.hint_box, rails: e.rails.clone() })
                 .collect();
         }
         let mut out = Vec::new();
         for (qi, ii, id) in slot_ids(feature, param) {
             match self.get(param, qi, ii, &id) {
-                Some(Ref::Edge { a, b, side, hint }) => out.push(EdgeSel { a, b, side, hint, hint_box: None }),
+                Some(Ref::Edge { a, b, side, hint }) => out.push(EdgeSel { a, b, side, hint, hint_box: None, rails: None }),
                 Some(_) => self.unresolved.push(format!("{id} (not an edge)")),
                 None => {}
             }

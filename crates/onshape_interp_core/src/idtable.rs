@@ -64,6 +64,14 @@ pub struct RegionEntry {
 pub struct FaceRef {
     pub feature: String,
     pub role: FaceRole,
+    /// For a loft's side surface: the box of the one panel meant (model
+    /// frame, metres), when the loft has several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<[f64; 6]>,
+    /// Points on the face (model frame, metres): the blend's rails that
+    /// lie on it. They name the loft panel(s) the face is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pts: Option<Vec<[f64; 3]>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +133,11 @@ pub enum Ref {
         entity: String,
         t0: f64,
         t1: f64,
+        /// The face's two ends on the entity (world, metres, at the sketch
+        /// plane): more robust than the fractions when the entity is split
+        /// into several pieces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ends: Option<[[f64; 3]; 2]>,
     },
     /// Per sketch (key `<feature>/sketch`): whether the seed fit's frame is
     /// mirrored relative to Onshape's sketch normal, decided against the API
@@ -171,6 +184,11 @@ pub struct EdgeRef {
     pub side: SideRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint_box: Option<[f64; 6]>,
+    /// The blend face's rails (its tangent edges on the two faces), each
+    /// as start / middle / end points (model frame, metres): the edge
+    /// runs between them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rails: Option<Vec<[[f64; 3]; 3]>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -269,8 +287,8 @@ mod tests {
         t.insert(
             "RFB9",
             Ref::Edge {
-                a: FaceRef { feature: "F1".into(), role: FaceRole::Cap },
-                b: FaceRef { feature: "F2".into(), role: FaceRole::Wall },
+                a: FaceRef { feature: "F1".into(), role: FaceRole::Cap, bbox: None, pts: None },
+                b: FaceRef { feature: "F2".into(), role: FaceRole::Wall, bbox: None, pts: None },
                 side: SideRef::Top,
                 hint: None,
             },

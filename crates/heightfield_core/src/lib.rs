@@ -25,7 +25,7 @@ pub mod loft;
 pub mod payload;
 pub mod raster;
 
-use sketch_regions_core::Region;
+use sketch_regions_core::{Piece, Region};
 
 /// A regular grid of cell centres: cell `(i, j)` is at
 /// `(x0 + (i + 0.5) pitch, y0 + (j + 0.5) pitch)`.
@@ -392,6 +392,11 @@ pub struct Prism {
     pub dir: [f64; 3],
     pub w0: f64,
     pub w1: f64,
+    /// When set, the body's surfaces are labelled: `label` (face 0) for
+    /// the end caps, `label + 1 + entity` for the swept boundary
+    /// entities (consecutive pieces of one sketch entity form one face),
+    /// which are the top and bottom of a sweep that is not vertical.
+    pub label: Option<u32>,
 }
 
 fn inv3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
@@ -442,6 +447,27 @@ impl Prism {
         // Along a column, (a, b, w) = q0(x, y) + z * q1.
         let q1 = mul3(&inv, [0.0, 0.0, 1.0]);
         let vertical = q1[0].abs() < 1e-12 && q1[1].abs() < 1e-12;
+        // Face number of each boundary piece: its entity's number.
+        let pieces: Vec<&Piece> = self.region.pieces().collect();
+        let mut ent_face: Vec<u32> = Vec::with_capacity(pieces.len());
+        let mut ents: Vec<&str> = Vec::new();
+        for p in &pieces {
+            let e = match ents.iter().position(|id| *id == p.id.as_str()) {
+                Some(e) => e,
+                None => {
+                    ents.push(p.id.as_str());
+                    ents.len() - 1
+                }
+            };
+            ent_face.push(1 + (e as u32) % (LABEL_FACES - 1));
+        }
+        let mut span = |body: &mut Body, k: usize, za: f64, zb: f64, fa: u32, fb: u32| match self.label {
+            Some(base) => {
+                body.include_labelled(k, za as f32, base + fa);
+                body.include_labelled(k, zb as f32, base + fb);
+            }
+            None => body.include_span(k, za as f32, zb as f32),
+        };
         // Footprint bounding box in the grid: sample the region's bbox corners
         // at both sweep ends (exact for the prism's convex hull).
         let bb = self.region.bbox();
@@ -477,12 +503,12 @@ impl Prism {
                     let z0 = (self.w0 - q0[2]) / q1[2];
                     let z1 = (self.w1 - q0[2]) / q1[2];
                     let (za, zb) = if z0 <= z1 { (z0, z1) } else { (z1, z0) };
-                    body.include_span(k, za as f32, zb as f32);
+                    span(&mut body, k, za, zb, 0, 0);
                 } else {
                     // The column traces the line (a, b)(z) = q0 + z q1 in the
                     // plane; material where it is inside the region and the
                     // sweep coordinate is within range.
-                    let ivs = self.region.line_intervals([q0[0], q0[1]], [q1[0], q1[1]]);
+                    let ivs = self.region.line_intervals_with([q0[0], q0[1]], [q1[0], q1[1]]);
                     if ivs.is_empty() {
                         continue;
                     }
@@ -495,11 +521,14 @@ impl Prism {
                     } else if q0[2] < self.w0 || q0[2] > self.w1 {
                         continue;
                     }
-                    for (s0, s1) in ivs {
+                    for (s0, s1, p0, p1) in ivs {
                         let za = s0.max(wa);
                         let zb = s1.min(wb);
                         if za < zb {
-                            body.include_span(k, za as f32, zb as f32);
+                            // Clipped by the sweep range: an end cap (face 0).
+                            let fa = if za > s0 { 0 } else { ent_face[p0] };
+                            let fb = if zb < s1 { 0 } else { ent_face[p1] };
+                            span(&mut body, k, za, zb, fa, fb);
                         }
                     }
                 }
@@ -515,14 +544,34 @@ impl Prism {
 
 /// A face of the solid as the blend machinery sees it: the cells a feature
 /// labelled, or the vertical wall a feature made.
+/// Cell labels are `feature number * LABEL_FACES + face number`.
+pub const LABEL_FACES: u32 = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaceSel {
     Cap(u32),
+    /// Any cap of feature `base / LABEL_FACES` whose face number
+    /// (`label % LABEL_FACES`) has its bit set in the mask.
+    Caps(u32, u64),
     Wall(u32),
     /// The footprint's vertical side wall.
     Outline,
     /// Any cap face at all.
     AnyCap,
+    /// Any wall, whoever made it.
+    AnyWall,
+}
+
+impl FaceSel {
+    /// Whether a cell labelled `label` belongs to this cap selector.
+    pub fn matches_cap(self, label: u32) -> bool {
+        match self {
+            FaceSel::Cap(l) => label == l,
+            FaceSel::Caps(base, mask) => label / LABEL_FACES == base / LABEL_FACES && (mask >> (label % LABEL_FACES)) & 1 == 1,
+            FaceSel::AnyCap => true,
+            _ => false,
+        }
+    }
 }
 
 /// Cells on the selected edge, on the side of the first face selector, with
@@ -559,14 +608,14 @@ impl Solid {
     /// crease between two differently labelled caps.
     pub fn edge_cells(&self, side: Side, a: FaceSel, b: FaceSel, jump: f32) -> EdgeCells {
         let (cap, other) = match (a, b) {
-            (FaceSel::Cap(_) | FaceSel::AnyCap, _) => (a, b),
-            (_, FaceSel::Cap(_) | FaceSel::AnyCap) => (b, a),
+            (FaceSel::Cap(_) | FaceSel::Caps(..) | FaceSel::AnyCap, _) => (a, b),
+            (_, FaceSel::Cap(_) | FaceSel::Caps(..) | FaceSel::AnyCap) => (b, a),
             _ => return EdgeCells::default(),
         };
         let g = &self.grid;
         let (h, label, order) = self.field(side);
         let sign = if side == Side::Top { 1.0f32 } else { -1.0 };
-        let mut out = EdgeCells { b_has_cells: matches!(other, FaceSel::Cap(_) | FaceSel::AnyCap), ..Default::default() };
+        let mut out = EdgeCells { b_has_cells: matches!(other, FaceSel::Cap(_) | FaceSel::Caps(..) | FaceSel::AnyCap), ..Default::default() };
         let mut convex_votes: i64 = 0;
         for j in 0..g.ny {
             for i in 0..g.nx {
@@ -574,10 +623,8 @@ impl Solid {
                 if h[k].is_nan() {
                     continue;
                 }
-                if let FaceSel::Cap(l) = cap {
-                    if label[k] != l {
-                        continue;
-                    }
+                if !cap.matches_cap(label[k]) {
+                    continue;
                 }
                 for (di, dj) in NEIGHBOURS {
                     let (ii, jj) = (i as isize + di, j as isize + dj);
@@ -590,9 +637,9 @@ impl Solid {
                     let is_wall = !n_empty && dz.abs() >= jump;
                     let hit = match other {
                         FaceSel::Outline => n_empty,
+                        FaceSel::AnyWall => is_wall,
                         FaceSel::Wall(l) => is_wall && (if order[k] >= order[n] { label[k] } else { label[n] }) == l,
-                        FaceSel::Cap(l) => !n_empty && !is_wall && label[n] == l && label[n] != label[k],
-                        FaceSel::AnyCap => !n_empty && !is_wall && label[n] != label[k],
+                        FaceSel::Cap(_) | FaceSel::Caps(..) | FaceSel::AnyCap => !n_empty && !is_wall && other.matches_cap(label[n]) && label[n] != label[k],
                     };
                     if !hit {
                         continue;
@@ -645,6 +692,7 @@ mod tests {
             dir: [0.0, 0.0, 1.0],
             w0: 0.0,
             w1: 2.0,
+            label: None,
         };
         let rep = s.extrude(&slab, Op::Add, 1, 1);
         assert_eq!(rep.cells_changed, 20 * 16);
@@ -710,6 +758,7 @@ mod tests {
             dir: [1.0, 0.0, 0.0],
             w0: 0.0,
             w1: 4.0,
+            label: None,
         };
         s.extrude(&ridge, Op::Add, 1, 1);
         let k = grid.idx(4, 4); // (2.25, 2.25): height 2 - |y - 2| = 1.75

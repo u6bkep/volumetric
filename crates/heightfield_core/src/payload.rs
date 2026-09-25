@@ -163,7 +163,7 @@ mod tests {
         let region = arrange(&[p([0.0, 0.0], [4.0, 0.0]), p([4.0, 0.0], [4.0, 3.0]), p([4.0, 3.0], [0.0, 3.0]), p([0.0, 3.0], [0.0, 0.0])], 1e-9)
             .remove(0);
         s.outline = Some(vec![region.clone()]);
-        let prism = Prism { region, origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], dir: [0.0, 0.0, 1.0], w0: 0.5, w1: 2.0 };
+        let prism = Prism { region, origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], dir: [0.0, 0.0, 1.0], w0: 0.5, w1: 2.0, label: None };
         s.extrude(&prism, Op::Add, 1, 1);
         let bytes = build_payload(&s).unwrap();
         let view = PayloadView::new(&bytes).unwrap();

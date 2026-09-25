@@ -346,6 +346,100 @@ pub fn blend(
     rep
 }
 
+impl Kernel {
+    /// The blend profile against a vertical wall: how far below the cap
+    /// (convex) or above the floor (concave) the blend surface lies at
+    /// horizontal distance `d` from the wall, for `d` up to the reach.
+    pub fn wall_profile(&self, d: f64) -> f64 {
+        match *self {
+            Kernel::Ball { r } => {
+                let d = d.clamp(0.0, r);
+                r - (r * r - (r - d) * (r - d)).max(0.0).sqrt()
+            }
+            Kernel::Cone { radius, height } => height * (1.0 - d / radius).clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// Blend an edge against a wall (a face without cells of its own: another
+/// feature's vertical wall or the footprint wall) by sweeping the kernel's
+/// profile along the edge: every cap cell within the kernel's reach of the
+/// wall takes the profile height at its distance from the wall. Unlike a
+/// rolling ball this fits into features narrower than the kernel, as a
+/// planar chamfer or a constant-radius fillet does in the CAD model.
+pub fn sweep_blend(
+    solid: &mut Solid,
+    side: Side,
+    edge: &EdgeCells,
+    kernel: &Kernel,
+    convex: bool,
+    label: u32,
+    order: u32,
+    opts: BlendOptions,
+) -> BlendReport {
+    let mut rep = BlendReport { edge_cells: edge.cells.len(), ..Default::default() };
+    if edge.cells.is_empty() {
+        return rep;
+    }
+    let g = solid.grid.clone();
+    let (nx, ny) = (g.nx, g.ny);
+    let sign = if side == Side::Top { 1.0f32 } else { -1.0 };
+    let h: Vec<f32> = match side {
+        Side::Top => solid.top.clone(),
+        Side::Bottom => solid.bot.iter().map(|v| -v).collect(),
+    };
+    let mut is_edge = vec![false; g.len()];
+    for &k in &edge.cells {
+        is_edge[k] = true;
+    }
+    let mut is_across = vec![false; g.len()];
+    for &n in &edge.across {
+        is_across[n] = true;
+    }
+    let (d2_edge, nearest_edge) = edt::distance_to_sites(nx, ny, |k| is_edge[k]);
+    let (d2_across, _) = edt::distance_to_sites(nx, ny, |k| is_across[k]);
+    let rc = kernel.radius() / g.pitch;
+    let cells: Vec<usize> = (0..g.len()).filter(|&k| !h[k].is_nan() && d2_edge[k].sqrt() <= rc + 1.0 && d2_edge[k] <= d2_across[k]).collect();
+    let vals: Vec<f32> = map_par(&cells, |&k| {
+        let e = nearest_edge[k];
+        if e == usize::MAX {
+            return f32::NAN;
+        }
+        // The wall stands half a cell beyond the edge cells' centres.
+        let d = (d2_edge[k].sqrt() + 0.5) * g.pitch;
+        let p = kernel.wall_profile(d) as f32;
+        let z = h[e];
+        if convex { z - p } else { z + p }
+    });
+    rep.valid_centres = cells.len();
+    for (&k, &v) in cells.iter().zip(vals.iter()) {
+        if !v.is_finite() {
+            continue;
+        }
+        let delta = v - h[k];
+        let delta = if convex { delta.min(0.0) } else { delta.max(0.0) };
+        if delta.abs() as f64 <= opts.min_change {
+            continue;
+        }
+        let new = h[k] + delta;
+        match side {
+            Side::Top => {
+                solid.top[k] = new * sign;
+                solid.top_label[k] = label;
+                solid.top_order[k] = order;
+            }
+            Side::Bottom => {
+                solid.bot[k] = -new;
+                solid.bot_label[k] = label;
+                solid.bot_order[k] = order;
+            }
+        }
+        rep.cells_changed += 1;
+        rep.max_change = rep.max_change.max(delta.abs() as f64);
+    }
+    rep
+}
+
 #[cfg(feature = "parallel")]
 fn map_par<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
     use rayon::prelude::*;
@@ -380,6 +474,7 @@ mod tests {
             dir: [0.0, 0.0, 1.0],
             w0: 0.0,
             w1: 4.0,
+            label: None,
         };
         s.extrude(&slab, Op::Add, 1, 1);
         // A step: the right half is 3 units higher.
@@ -496,6 +591,7 @@ mod tests {
             dir: [0.0, 0.0, 1.0],
             w0: 0.0,
             w1: 1.0,
+            label: None,
         };
         s.extrude(&groove, Op::Remove, 3, 3);
         let edge = s.edge_cells(Side::Bottom, FaceSel::Cap(3), FaceSel::Wall(3), 0.01);
