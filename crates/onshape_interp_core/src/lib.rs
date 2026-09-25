@@ -50,6 +50,20 @@ fn norm3(a: [f64; 3]) -> f64 {
     (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
 }
 
+/// Mean of the boundary piece midpoints (rounded, for ordering).
+fn region_centroid(r: &Region) -> (i64, i64) {
+    let mut sx = 0.0f64;
+    let mut sy = 0.0f64;
+    let mut n = 0.0f64;
+    for p in r.pieces() {
+        let m = p.curve.point(0.5);
+        sx += m[0];
+        sy += m[1];
+        n += 1.0;
+    }
+    ((sx / n.max(1.0) * 1e6).round() as i64, (sy / n.max(1.0) * 1e6).round() as i64)
+}
+
 pub(crate) fn unit3(a: [f64; 3]) -> [f64; 3] {
     let n = norm3(a).max(1e-300);
     [a[0] / n, a[1] / n, a[2] / n]
@@ -179,17 +193,41 @@ impl SolvedSketch {
             .collect();
     }
 
-    /// The region whose boundary ids are exactly `ids`, else the largest
-    /// region whose boundary lies within `ids`.
-    pub fn region_by_ids(&self, ids: &[String]) -> Option<&Region> {
+    /// The region whose boundary ids are exactly `ids` (the `pick`-th in
+    /// centroid order when several share them), else the largest region
+    /// whose boundary lies within `ids`.
+    pub fn region_by_ids(&self, ids: &[String], pick: Option<usize>) -> Option<&Region> {
         let set: std::collections::BTreeSet<&str> = ids.iter().map(|s| s.as_str()).collect();
-        if let Some(r) = self.regions.iter().find(|r| r.ids.iter().map(|s| s.as_str()).collect::<std::collections::BTreeSet<_>>() == set) {
-            return Some(r);
+        let exact = self.regions_with_ids(&set);
+        if !exact.is_empty() {
+            return Some(exact[pick.unwrap_or(0).min(exact.len() - 1)]);
         }
         self.regions
             .iter()
             .filter(|r| r.ids.iter().all(|i| set.contains(i.as_str())))
             .max_by(|a, b| a.area.partial_cmp(&b.area).unwrap())
+    }
+
+    /// Regions whose boundary id set is exactly `set`, in centroid order.
+    pub fn regions_with_ids(&self, set: &std::collections::BTreeSet<&str>) -> Vec<&Region> {
+        let mut v: Vec<&Region> = self.regions.iter().filter(|r| r.ids.iter().map(|s| s.as_str()).collect::<std::collections::BTreeSet<_>>() == *set).collect();
+        v.sort_by(|a, b| {
+            let ca = region_centroid(a);
+            let cb = region_centroid(b);
+            ca.partial_cmp(&cb).unwrap()
+        });
+        v
+    }
+
+    /// The index of `region` among the regions sharing its boundary ids.
+    pub fn region_pick(&self, region: &Region) -> Option<usize> {
+        let set: std::collections::BTreeSet<&str> = region.ids.iter().map(|s| s.as_str()).collect();
+        let same = self.regions_with_ids(&set);
+        if same.len() < 2 {
+            return None;
+        }
+        let c = region_centroid(region);
+        same.iter().position(|r| region_centroid(r) == c)
     }
 
     /// The 3D point of a sketch point entity (or a curve end: `id.start` /

@@ -53,6 +53,14 @@ pub enum FaceRole {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RegionEntry {
+    pub sketch: String,
+    pub ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FaceRef {
     pub feature: String,
     pub role: FaceRole,
@@ -83,6 +91,10 @@ pub enum Ref {
     Region {
         sketch: String,
         ids: Vec<String>,
+        /// Which region when several share the same boundary ids (two
+        /// lobes of one lens): index in centroid order (u, then v).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pick: Option<usize>,
     },
     Face {
         feature: String,
@@ -94,6 +106,12 @@ pub enum Ref {
         side: SideRef,
         #[serde(default)]
         hint: Option<[f64; 3]>,
+    },
+    /// All regions a parameter (or one loft profile item) names, as a set:
+    /// ids regroup between configurations and a region may not exist at
+    /// every one, so the list is matched as a whole.
+    RegionList {
+        regions: Vec<RegionEntry>,
     },
     SketchPoint {
         sketch: String,
@@ -175,6 +193,15 @@ impl IdTable {
     /// The slot key for the `ii`-th id of the `qi`-th query of a parameter.
     pub fn slot_key(feature: &str, param: &str, qi: usize, ii: usize) -> String {
         format!("{feature}/{param}/{qi}/{ii}")
+    }
+
+    /// The key of a parameter's whole region list (`item` for one loft
+    /// profile item).
+    pub fn list_key(feature: &str, param: &str, item: Option<usize>) -> String {
+        match item {
+            Some(i) => format!("{feature}/{param}/item{i}"),
+            None => format!("{feature}/{param}"),
+        }
     }
 
     pub fn insert_slot(&mut self, key: &str, r: Ref, source: &str) {

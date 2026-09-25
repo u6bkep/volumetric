@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use fs_expr::{Scope, Value};
 use serde_json::Value as Json;
 
-use crate::idtable::{FaceRef, IdTable, Ref, SideRef};
+use crate::idtable::{FaceRef, IdTable, Ref, RegionEntry, SideRef};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoolOp {
@@ -31,6 +31,7 @@ pub enum Bound {
 pub struct RegionSel {
     pub sketch: String,
     pub ids: Vec<String>,
+    pub pick: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -232,11 +233,21 @@ impl Resolver<'_> {
         self.get(param, qi, ii, &id)
     }
 
+    fn list(&self, param: &str, item: Option<usize>) -> Option<Vec<RegionSel>> {
+        match self.table.slots.get(&IdTable::list_key(&self.feature, param, item)).map(|e| &e.r) {
+            Some(Ref::RegionList { regions }) => Some(regions.iter().map(|r: &RegionEntry| RegionSel { sketch: r.sketch.clone(), ids: r.ids.clone(), pick: r.pick }).collect()),
+            _ => None,
+        }
+    }
+
     fn regions_of(&mut self, feature: &Json, param: &str) -> Vec<RegionSel> {
+        if let Some(list) = self.list(param, None) {
+            return list;
+        }
         let mut out = Vec::new();
         for (qi, ii, id) in slot_ids(feature, param) {
             match self.get(param, qi, ii, &id) {
-                Some(Ref::Region { sketch, ids }) => out.push(RegionSel { sketch, ids }),
+                Some(Ref::Region { sketch, ids, pick }) => out.push(RegionSel { sketch, ids, pick }),
                 Some(_) => self.unresolved.push(format!("{id} (not a region)")),
                 None => {}
             }
@@ -249,7 +260,7 @@ impl Resolver<'_> {
         for (qi, (_, ids)) in qs.iter().enumerate() {
             for (ii, id) in ids.iter().enumerate() {
                 match self.get(param, qi + q_offset, ii, id) {
-                    Some(Ref::Region { sketch, ids }) => out.push(RegionSel { sketch, ids }),
+                    Some(Ref::Region { sketch, ids, pick }) => out.push(RegionSel { sketch, ids, pick }),
                     Some(_) => self.unresolved.push(format!("{id} (not a region)")),
                     None => {}
                 }
@@ -413,12 +424,15 @@ pub fn plan_feature(
                 let mut profiles: Vec<Vec<RegionSel>> = Vec::new();
                 let mut q_offset = 0;
                 if let Some(items) = param(feature, "sheetProfilesArray").and_then(|p| p["items"].as_array()) {
-                    for it in items {
+                    for (item, it) in items.iter().enumerate() {
                         let ps = it["message"]["parameters"].as_array().cloned().unwrap_or_default();
                         for p in ps {
                             if p["message"]["parameterId"] == "sheetProfileEntities" {
                                 let qs = queries(&p["message"]);
-                                let regs = res.regions_in("sheetProfileEntities", &qs, q_offset);
+                                let regs = match res.list("sheetProfileEntities", Some(item)) {
+                                    Some(list) => list,
+                                    None => res.regions_in("sheetProfileEntities", &qs, q_offset),
+                                };
                                 q_offset += qs.len();
                                 if !regs.is_empty() {
                                     profiles.push(regs);

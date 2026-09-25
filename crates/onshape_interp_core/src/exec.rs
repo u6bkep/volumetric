@@ -144,7 +144,7 @@ impl Exec {
 
     fn region_of<'a>(&'a self, sel: &RegionSel) -> Result<(&'a SolvedSketch, &'a Region), String> {
         let sk = self.sketches.get(&sel.sketch).ok_or_else(|| format!("sketch {} not solved", sel.sketch))?;
-        let r = sk.region_by_ids(&sel.ids).ok_or_else(|| format!("sketch {} has no region bounded by {:?}", sk.name, sel.ids))?;
+        let r = sk.region_by_ids(&sel.ids, sel.pick).ok_or_else(|| format!("sketch {} has no region bounded by {:?}", sk.name, sel.ids))?;
         Ok((sk, r))
     }
 
@@ -218,6 +218,7 @@ impl Exec {
         let mut horizontal = true;
         let mut sweep_desc = String::new();
         let mut missing = Vec::new();
+        let mut region_areas: Vec<String> = Vec::new();
         for sel in regions {
             let (sk, region) = match self.region_of(sel) {
                 Ok(x) => x,
@@ -226,12 +227,13 @@ impl Exec {
                     continue;
                 }
             };
+            region_areas.push(format!("{:.1}in2{}", region.area / (0.0254 * 0.0254), sel.pick.map(|p| format!("#{p}")).unwrap_or_default()));
             let mut dir = direction.unwrap_or(sk.normal);
             if flip {
                 dir = [-dir[0], -dir[1], -dir[2]];
             }
             let (w0, w1) = self.sweep(sk.frame.origin, sk.normal, dir, end, second)?;
-            sweep_desc = format!("sketch {} normal ({:.2},{:.2},{:.2}) dir ({:.2},{:.2},{:.2}) w [{:.4}, {:.4}] m", sk.name, sk.normal[0], sk.normal[1], sk.normal[2], dir[0], dir[1], dir[2], w0, w1);
+            sweep_desc = format!("sketch {} normal ({:.2},{:.2},{:.2}) dir ({:.2},{:.2},{:.2}) w [{:.4}, {:.4}] m; regions {}", sk.name, sk.normal[0], sk.normal[1], sk.normal[2], dir[0], dir[1], dir[2], w0, w1, region_areas.join("/"));
             let prism = Prism { region: region.clone(), origin: sk.frame.origin, u: sk.frame.ex, v: sk.frame.ey, dir, w0, w1 };
             let pb = prism.body(&self.grid);
             for k in 0..self.grid.len() {
@@ -542,6 +544,15 @@ impl Exec {
         let mut summary = Vec::new();
         for tool in tools {
             let ts = self.bodies.remove(tool).ok_or_else(|| format!("tool body of feature {tool} does not exist"))?;
+            let (mut lo_min, mut lo_max, mut n) = (f32::INFINITY, f32::NEG_INFINITY, 0usize);
+            for k in 0..ts.grid.len() {
+                if !ts.bot[k].is_nan() {
+                    lo_min = lo_min.min(ts.bot[k]);
+                    lo_max = lo_max.max(ts.bot[k]);
+                    n += 1;
+                }
+            }
+            summary.push(format!("tool {} columns, bottom {:.4}..{:.4} m", n, lo_min, lo_max));
             let body = Body { grid: ts.grid.clone(), lo: ts.bot.clone(), hi: ts.top.clone(), hi_label: None, lo_label: None };
             let hf_op = match op {
                 BoolOp::Add => Op::Add,
