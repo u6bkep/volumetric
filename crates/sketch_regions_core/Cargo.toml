@@ -1,0 +1,7 @@
+[package]
+name = "sketch_regions_core"
+version = "0.1.0"
+edition = "2024"
+description = "Exact 2D lines and arcs: planar arrangement of sketch curves into regions, containment, signed distance, line intersections and region booleans"
+
+[dependencies]

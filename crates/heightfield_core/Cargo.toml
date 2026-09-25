@@ -1,0 +1,13 @@
+[package]
+name = "heightfield_core"
+version = "0.1.0"
+edition = "2024"
+description = "2.5D solids as top/bottom height fields over an exact outline: extrudes, lofts, rolling-ball fillets and chamfers on a grid, plus the model payload"
+
+[dependencies]
+sketch_regions_core = { path = "../sketch_regions_core" }
+rayon = { version = "1", optional = true }
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
