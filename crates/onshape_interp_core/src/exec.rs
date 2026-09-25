@@ -795,6 +795,12 @@ impl Exec {
                         poly.reverse();
                         (s1a, s0b, d1a, d0b)
                     };
+                    if std::env::var("GUIDE_DUMP").ok().and_then(|v| v.parse::<usize>().ok()) == Some(p.index) {
+                        let (r0, r1) = (raw[0], *raw.last().unwrap());
+                        let (g0, g1) = (poly[0], *poly.last().unwrap());
+                        let f = |q: P3| format!("({:.2},{:.2},{:.2})", q[0] / 0.0254, q[1] / 0.0254, q[2] / 0.0254);
+                        eprintln!("GUIDE_DUMP {} guide {:?}: raw {} -> {} ({} pts), trimmed {} -> {}, sA {:.0}mm ({:.1}mm off) sB {:.0}mm ({:.1}mm off)", p.index, g, f(r0), f(r1), raw.len(), f(g0), f(g1), sa_ * 1e3, da * 1e3, sb_ * 1e3, db * 1e3);
+                    }
                     if da > 5e-3 || db > 5e-3 {
                         let (g0, g1) = (poly[0], *poly.last().unwrap());
                         let na = pa.at(&ca, sa_);
@@ -888,7 +894,10 @@ impl Exec {
                 }
                 // Onshape pairs the profiles' vertices when a strip holds
                 // the same number on each: map u piecewise through them,
-                // else uniformly by arc length.
+                // else uniformly by arc length. (Splitting an edge at equal
+                // parameter steps against several edges, which Onshape's
+                // faces suggest, measured worse overall: p90 0.58 -> 0.90
+                // mm on the 27x27 sample.)
                 let inner = |cum: &[f64], verts: &[usize], s0: f64, d: f64, total: f64| -> Vec<f64> {
                     let mut out: Vec<f64> = verts
                         .iter()
@@ -923,7 +932,7 @@ impl Exec {
                 let a = |u: f64| pa.at(&ca, s0a + map(u, &va, da_));
                 let b = |u: f64| b_at(s0b + map(u, &vb, db_));
                 if paired {
-                    guide_note.push_str(&format!("; panel {i}: {} vertex pairs", va.len()));
+                    guide_note.push_str(&format!("; panel {i}: {}/{} inner vertices", va.len(), vb.len()));
                 }
                 let glen = |g: &[P3]| g.windows(2).map(|w| ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2) + (w[1][2] - w[0][2]).powi(2)).sqrt()).sum::<f64>();
                 let nu = ((da_.max(db_) / 2e-3).ceil() as usize).clamp(4, 96);
