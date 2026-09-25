@@ -305,8 +305,16 @@ impl Solid {
                 let p = [g.x(i), g.y(j)];
                 let exact = outline.iter().map(|r| r.signed_distance(p)).fold(f64::NEG_INFINITY, f64::max);
                 // A column the exact outline contains but the mask lost was
-                // emptied by a cut; use the sampled distance there.
-                let d = if exact > 0.0 && !mask[k] { grid_sdf[k].min(exact) } else { exact };
+                // emptied by a cut, and one the mask holds beyond the outline
+                // was added by a sweep the outline does not track; the sampled
+                // distance stands in for both.
+                let d = if exact > 0.0 && !mask[k] {
+                    grid_sdf[k].min(exact)
+                } else if exact <= 0.0 && mask[k] {
+                    grid_sdf[k]
+                } else {
+                    exact
+                };
                 out[k] = d as f32;
             }
         }

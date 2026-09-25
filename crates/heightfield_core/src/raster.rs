@@ -60,6 +60,82 @@ pub fn include_cap(body: &mut Body, region: &Region, z: f64) {
     }
 }
 
+/// Ear-clipping triangulation of a simple polygon (any orientation),
+/// returning index triples into `pts`. Degenerate (collinear) ears are
+/// clipped too so noisy loops still terminate.
+pub fn triangulate_loop(pts: &[[f64; 2]]) -> Vec<[usize; 3]> {
+    let n = pts.len();
+    let mut tris = Vec::new();
+    if n < 3 {
+        return tris;
+    }
+    // Orientation.
+    let area: f64 = (0..n).map(|i| {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        a[0] * b[1] - b[0] * a[1]
+    }).sum();
+    let sign = if area >= 0.0 { 1.0 } else { -1.0 };
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    // A vertex on the candidate ear's boundary blocks it too (a reflex
+    // vertex lying on the ear's chord would otherwise be cut through);
+    // only points coinciding with the ear's own corners are ignored.
+    let inside = |p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        let scale = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).max((c[0] - a[0]).powi(2) + (c[1] - a[1]).powi(2));
+        let eps = 1e-12 * scale;
+        let near = |q: [f64; 2]| (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) <= eps;
+        if near(a) || near(b) || near(c) {
+            return false;
+        }
+        let d1 = cross(a, b, p) * sign;
+        let d2 = cross(b, c, p) * sign;
+        let d3 = cross(c, a, p) * sign;
+        d1 >= -eps && d2 >= -eps && d3 >= -eps
+    };
+    let mut idx: Vec<usize> = (0..n).collect();
+    let mut guard = 0usize;
+    while idx.len() > 3 && guard < 4 * n * n {
+        guard += 1;
+        let m = idx.len();
+        let mut clipped = false;
+        for k in 0..m {
+            let (i0, i1, i2) = (idx[(k + m - 1) % m], idx[k], idx[(k + 1) % m]);
+            let (a, b, c) = (pts[i0], pts[i1], pts[i2]);
+            let convex = cross(a, b, c) * sign;
+            if convex < 0.0 {
+                continue;
+            }
+            let mut ear = true;
+            if convex > 0.0 {
+                for &j in &idx {
+                    if j != i0 && j != i1 && j != i2 && inside(pts[j], a, b, c) {
+                        ear = false;
+                        break;
+                    }
+                }
+            }
+            if ear {
+                if convex > 0.0 {
+                    tris.push([i0, i1, i2]);
+                }
+                idx.remove(k);
+                clipped = true;
+                break;
+            }
+        }
+        if !clipped {
+            // Fall back: clip the first vertex regardless.
+            let (i0, i1, i2) = (idx[idx.len() - 1], idx[0], idx[1]);
+            tris.push([i0, i1, i2]);
+            idx.remove(0);
+        }
+    }
+    if idx.len() == 3 {
+        tris.push([idx[0], idx[1], idx[2]]);
+    }
+    tris
+}
+
 /// The body enclosed by a closed triangle mesh (assumed 2.5D: one material
 /// interval per column).
 pub fn body_from_mesh(grid: &Grid, tris: &[[P3; 3]]) -> Body {
@@ -117,6 +193,22 @@ pub fn read_stl(bytes: &[u8]) -> Result<Vec<[P3; 3]>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn triangulates_a_concave_polygon() {
+        // An L shape.
+        let pts = [[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]];
+        let tris = triangulate_loop(&pts);
+        assert_eq!(tris.len(), 4);
+        let area: f64 = tris
+            .iter()
+            .map(|[a, b, c]| {
+                let (p, q, r) = (pts[*a], pts[*b], pts[*c]);
+                0.5 * ((q[0] - p[0]) * (r[1] - p[1]) - (r[0] - p[0]) * (q[1] - p[1])).abs()
+            })
+            .sum();
+        assert!((area - 3.0).abs() < 1e-12);
+    }
 
     #[test]
     fn box_mesh_gives_its_columns() {

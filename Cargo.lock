@@ -4012,6 +4012,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "onshape_interp_core"
+version = "0.1.0"
+dependencies = [
+ "fs_expr",
+ "heightfield_core",
+ "onshape_import_core",
+ "serde",
+ "serde_json",
+ "sketch_regions_core",
+]
+
+[[package]]
 name = "open"
 version = "5.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

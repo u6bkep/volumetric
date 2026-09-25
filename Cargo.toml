@@ -138,6 +138,7 @@ members = [
     "crates/onshape_import_core",
     "crates/sketch_regions_core",
     "crates/heightfield_core",
+    "crates/onshape_interp_core",
 ]
 
 [features]

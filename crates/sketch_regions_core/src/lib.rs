@@ -268,11 +268,24 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
         vertex_of[i] = v;
     }
     let nv = vid.len();
-    // 4. Half-edges.
+    // 4. Half-edges. Sub-pieces joining the same two vertices along the same
+    // curve (a sketch line drawn twice, two rectangles sharing a side) are
+    // one edge; the duplicate is dropped so it cannot separate a face from
+    // itself. Loops (u == v) are full circles and are always distinct.
+    let mut seen: HashMap<(usize, usize, i64, i64), usize> = HashMap::new();
     let mut hes: Vec<HalfEdge> = Vec::with_capacity(2 * pieces.len());
     for (k, p) in pieces.iter().enumerate() {
         let u = vertex_of[2 * k];
         let v = vertex_of[2 * k + 1];
+        if u != v {
+            let (lo, hi) = if u < v { (u, v) } else { (v, u) };
+            let mid = p.curve.point(0.5);
+            let key = (lo, hi, (mid[0] / eps).round() as i64, (mid[1] / eps).round() as i64);
+            if seen.contains_key(&key) {
+                continue;
+            }
+            seen.insert(key, k);
+        }
         let f = hes.len();
         hes.push(HalfEdge { from: u, to: v, curve: p.curve, piece: k, twin: f + 1 });
         hes.push(HalfEdge { from: v, to: u, curve: p.curve.reversed(), piece: k, twin: f });
@@ -281,12 +294,18 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
     for (h, he) in hes.iter().enumerate() {
         out[he.from].push(h);
     }
+    // Tangent junctions (fillet arcs meeting lines, arcs touching circles)
+    // leave a vertex in the same direction up to the snapping error, which
+    // for an arc of radius r is about eps / r in angle; there the curvature
+    // orders them (the piece curving left is counter-clockwise of the one
+    // curving right).
+    let angle_tol = 1e-5f64.max(100.0 * eps);
     for list in out.iter_mut() {
         list.sort_by(|&a, &b| {
             let ka = angle_key(&hes[a]);
             let kb = angle_key(&hes[b]);
             let d = ka.0 - kb.0;
-            if d.abs() > 1e-9 {
+            if d.abs() > angle_tol {
                 d.partial_cmp(&0.0).unwrap()
             } else {
                 ka.1.partial_cmp(&kb.1).unwrap()
@@ -607,6 +626,17 @@ mod tests {
     }
 
     #[test]
+    fn two_rectangles_sharing_a_side() {
+        let mut pieces = rect("A", 0.0, 0.0, 1.0, 1.0);
+        pieces.extend(rect("B", 1.0, 0.0, 2.0, 1.0));
+        let regs = arrange(&pieces, 1e-9);
+        assert_eq!(regs.len(), 2);
+        for r in &regs {
+            assert!((r.area - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn booleans_of_overlapping_rectangles() {
         let a = arrange(&rect("A", 0.0, 0.0, 2.0, 2.0), 1e-9);
         let b = arrange(&rect("B", 1.0, 1.0, 3.0, 3.0), 1e-9);
@@ -631,4 +661,6 @@ mod tests {
         assert_eq!(union(&a, &e, 1e-9).len(), 2);
     }
 }
+
+
 

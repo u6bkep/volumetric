@@ -1,0 +1,13 @@
+[package]
+name = "onshape_interp_core"
+version = "0.1.0"
+edition = "2024"
+description = "Interprets an Onshape feature list (extrudes, lofts, fillets, chamfers, booleans) in 2.5D over solved sketches, producing a heightfield_core solid; geometry references resolve through a semantic id table"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+fs_expr = { path = "../fs_expr" }
+sketch_regions_core = { path = "../sketch_regions_core" }
+heightfield_core = { path = "../heightfield_core" }
+onshape_import_core = { path = "../onshape_import_core" }
