@@ -10,6 +10,12 @@ pub type P3 = [f64; 3];
 /// Add the triangles' heights to `body`. Vertical triangles (no projected
 /// area) contribute nothing; their neighbours cover their columns.
 pub fn include_triangles(body: &mut Body, tris: &[[P3; 3]]) {
+    include_triangles_labelled(body, tris, None)
+}
+
+/// [`include_triangles`] with a face label recorded on the columns whose
+/// extreme the triangles set.
+pub fn include_triangles_labelled(body: &mut Body, tris: &[[P3; 3]], label: Option<u32>) {
     let g = body.grid.clone();
     for t in tris {
         let [a, b, c] = *t;
@@ -39,7 +45,10 @@ pub fn include_triangles(body: &mut Body, tris: &[[P3; 3]]) {
                     continue;
                 }
                 let z = l1 * a[2] + l2 * b[2] + l3 * c[2];
-                body.include(g.idx(i, j), z as f32);
+                match label {
+                    Some(l) => body.include_labelled(g.idx(i, j), z as f32, l),
+                    None => body.include(g.idx(i, j), z as f32),
+                }
             }
         }
     }
@@ -48,13 +57,20 @@ pub fn include_triangles(body: &mut Body, tris: &[[P3; 3]]) {
 /// Add a planar cap: height `z` over every cell centre inside `region`
 /// (region coordinates are the grid's x / y).
 pub fn include_cap(body: &mut Body, region: &Region, z: f64) {
+    include_cap_labelled(body, region, z, None)
+}
+
+pub fn include_cap_labelled(body: &mut Body, region: &Region, z: f64, label: Option<u32>) {
     let g = body.grid.clone();
     let bb = region.bbox();
     let (i0, i1, j0, j1) = g.cells_in([bb[0] - g.pitch, bb[1] - g.pitch, bb[2] + g.pitch, bb[3] + g.pitch]);
     for j in j0..j1 {
         for i in i0..i1 {
             if region.contains([g.x(i), g.y(j)]) {
-                body.include(g.idx(i, j), z as f32);
+                match label {
+                    Some(l) => body.include_labelled(g.idx(i, j), z as f32, l),
+                    None => body.include(g.idx(i, j), z as f32),
+                }
             }
         }
     }

@@ -33,9 +33,13 @@ pub struct SolvedSketch {
     /// Onshape's sketch normal (the frame's normal, possibly negated).
     pub normal: [f64; 3],
     pub pieces: Vec<Piece>,
+    /// Construction curves (never bound regions; usable as directions / axes).
+    pub construction: Vec<Piece>,
     pub regions: Vec<Region>,
     /// Point entities by id, in plane coordinates.
     pub points: HashMap<String, [f64; 2]>,
+    /// Feature index of the sketch in the tree (for coplanar context).
+    pub index: usize,
 }
 
 fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -64,11 +68,15 @@ impl SolvedSketch {
         eps: f64,
     ) -> SolvedSketch {
         let mut pieces = Vec::new();
+        let mut construction = Vec::new();
         let mut points = HashMap::new();
         for e in ents {
             match &e.geom {
                 Geom3d::Point(p) => {
                     points.insert(e.id.clone(), frame.to_2d(*p));
+                }
+                Geom3d::Line(a, b) if e.construction => {
+                    construction.push(Piece { id: e.id.clone(), curve: Curve::Line { a: frame.to_2d(*a), b: frame.to_2d(*b) } });
                 }
                 _ if e.construction => {}
                 Geom3d::Line(a, b) => {
@@ -90,15 +98,85 @@ impl SolvedSketch {
                     let d3 = [center[0] + direction[0], center[1] + direction[1], center[2] + direction[2]];
                     let d = frame.to_2d(d3);
                     let dir = [d[0] - c[0], d[1] - c[1]];
-                    let n = ((*major * 64.0 / 0.001).sqrt() as usize).clamp(48, 512);
-                    pieces.extend(ellipse_pieces(&e.id, c, *major, *minor, dir, n));
+                    // A multiple of four keeps the axis extremes as vertices,
+                    // where other curves are tangent to the ellipse.
+                    pieces.extend(ellipse_pieces(&e.id, c, *major, *minor, dir, 256));
                 }
             }
         }
         let regions = arrange(&pieces, eps);
         let n = unit3(cross3(frame.ex, frame.ey));
         let normal = if frame_flipped { [-n[0], -n[1], -n[2]] } else { n };
-        SolvedSketch { feature_id: feature_id.to_string(), name: name.to_string(), frame, normal, pieces, regions, points }
+        SolvedSketch { feature_id: feature_id.to_string(), name: name.to_string(), frame, normal, pieces, construction, regions, points, index: 0 }
+    }
+
+    /// Whether `other` lies in the same plane.
+    pub fn coplanar(&self, other: &SolvedSketch) -> bool {
+        let n = self.normal;
+        let d = [other.frame.origin[0] - self.frame.origin[0], other.frame.origin[1] - self.frame.origin[1], other.frame.origin[2] - self.frame.origin[2]];
+        let cross = cross3(n, other.normal);
+        norm3(cross) < 1e-6 && (d[0] * n[0] + d[1] * n[1] + d[2] * n[2]).abs() < 1e-6
+    }
+
+    /// Recompute the regions with the curves of earlier coplanar sketches
+    /// added: a sketch on a body face is split by that face's edges, which
+    /// in this model are the boundaries of earlier sketches' regions on the
+    /// same plane. Only regions touching the sketch's own curves are kept.
+    pub fn with_context(&mut self, earlier: &[&SolvedSketch]) {
+        self.with_context_and(earlier, &[]);
+    }
+
+    /// [`with_context`] plus extra pieces already in this sketch's plane
+    /// coordinates (the body's cross-section in the plane).
+    pub fn with_context_and(&mut self, earlier: &[&SolvedSketch], extra: &[Piece]) {
+        let mut all: Vec<Piece> = self.pieces.clone();
+        all.extend(extra.iter().cloned());
+        let own: std::collections::HashSet<&str> = self.pieces.iter().map(|p| p.id.as_str()).collect();
+        for sk in earlier {
+            for p in &sk.pieces {
+                let q = [sk.frame.to_3d(p.curve.start()), sk.frame.to_3d(p.curve.point(0.5)), sk.frame.to_3d(p.curve.end())];
+                let map = |x: [f64; 3]| self.frame.to_2d(x);
+                let curve = match p.curve {
+                    Curve::Line { .. } => Curve::Line { a: map(q[0]), b: map(q[2]) },
+                    Curve::Arc { r, sweep, .. } => {
+                        if sweep.abs() >= std::f64::consts::TAU - 1e-9 {
+                            let c = match p.curve {
+                                Curve::Arc { c, .. } => c,
+                                _ => unreachable!(),
+                            };
+                            Curve::circle(map(sk.frame.to_3d(c)), r)
+                        } else {
+                            let c = match p.curve {
+                                Curve::Arc { c, .. } => map(sk.frame.to_3d(c)),
+                                _ => unreachable!(),
+                            };
+                            // Turning direction in this frame from the midpoint.
+                            let a = map(q[0]);
+                            let m = map(q[1]);
+                            let b = map(q[2]);
+                            // An arc turning left lies entirely to the right
+                            // of its chord (any sweep), so a midpoint on the
+                            // left means the arc turns right.
+                            let left = (b[0] - a[0]) * (m[1] - a[1]) - (b[1] - a[1]) * (m[0] - a[0]) > 0.0;
+                            let _ = sweep;
+                            Curve::arc_from_ends(c, a, b, !left)
+                        }
+                    }
+                };
+                all.push(Piece { id: p.id.clone(), curve });
+            }
+        }
+        if all.len() == self.pieces.len() {
+            return;
+        }
+        // Keep the pieces of the sketch's own regions: a split region lies
+        // inside one of them and touches the sketch's own curves.
+        let own_regions = self.regions.clone();
+        self.regions = arrange(&all, 1e-7)
+            .into_iter()
+            .filter(|r| r.ids.iter().any(|i| own.contains(i.as_str())))
+            .filter(|r| r.interior_point().is_some_and(|p| own_regions.iter().any(|o| o.contains(p))))
+            .collect();
     }
 
     /// The region whose boundary ids are exactly `ids`, else the largest
@@ -118,5 +196,52 @@ impl SolvedSketch {
     /// `id.end` are point entities in the dumps already).
     pub fn point3(&self, id: &str) -> Option<[f64; 3]> {
         self.points.get(id).map(|p| self.frame.to_3d(*p))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ent(id: &str, geom: Geom3d) -> Entity3d {
+        Entity3d { id: id.into(), construction: false, geom }
+    }
+
+    #[test]
+    fn context_arcs_keep_their_side() {
+        // Source: a stadium (two lines, two semicircles) on z = 1, in a frame
+        // whose y axis is flipped; Onshape's normal is +z.
+        let z = 1.0;
+        let src_frame = Frame { origin: [0.0, 0.0, z], ex: [1.0, 0.0, 0.0], ey: [0.0, -1.0, 0.0] };
+        // Left cap: from (10, 25) to (10, 16), centre (10, 20.5), bulging to x < 10.
+        // Counter-clockwise about +z from (10,25) to (10,16) passes through x < 10? CCW from
+        // angle 90 deg to 270 deg goes through 180 deg = (5.5, 20.5): yes.
+        let src = vec![
+            ent("top", Geom3d::Line([10.0, 25.0, z], [16.0, 25.0, z])),
+            ent("bottom", Geom3d::Line([10.0, 16.0, z], [16.0, 16.0, z])),
+            ent("left", Geom3d::Arc { center: [10.0, 20.5, z], radius: 4.5, clockwise: false, start: [10.0, 25.0, z], end: [10.0, 16.0, z] }),
+            ent("right", Geom3d::Arc { center: [16.0, 20.5, z], radius: 4.5, clockwise: true, start: [16.0, 25.0, z], end: [16.0, 16.0, z] }),
+        ];
+        let a = SolvedSketch::from_entities("A", "A", &src, src_frame, true, 1e-9);
+        assert_eq!(a.regions.len(), 1);
+        let stadium = 6.0 * 9.0 + std::f64::consts::PI * 4.5 * 4.5;
+        assert!((a.regions[0].area - stadium).abs() < 1e-9, "{}", a.regions[0].area);
+        // Target: a rectangle over the lower-left corner, identity frame.
+        let tgt_frame = Frame { origin: [0.0, 0.0, z], ex: [1.0, 0.0, 0.0], ey: [0.0, 1.0, 0.0] };
+        let tgt = vec![
+            ent("r.b", Geom3d::Line([5.5, 16.0, z], [13.0, 16.0, z])),
+            ent("r.r", Geom3d::Line([13.0, 16.0, z], [13.0, 20.5, z])),
+            ent("r.t", Geom3d::Line([13.0, 20.5, z], [5.5, 20.5, z])),
+            ent("r.l", Geom3d::Line([5.5, 20.5, z], [5.5, 16.0, z])),
+        ];
+        let mut b = SolvedSketch::from_entities("B", "B", &tgt, tgt_frame, false, 1e-9);
+        b.with_context(&[&a]);
+        // The rectangle is split by the left cap's arc into the corner piece
+        // outside the stadium and the rest.
+        assert_eq!(b.regions.len(), 2, "{:?}", b.regions.iter().map(|r| r.area).collect::<Vec<_>>());
+        let corner = b.regions.iter().map(|r| r.area).fold(f64::INFINITY, f64::min);
+        // Corner = rectangle 4.5 x 4.5 minus the quarter disc.
+        let expect = 4.5 * 4.5 - std::f64::consts::PI * 4.5 * 4.5 / 4.0;
+        assert!((corner - expect).abs() < 1e-9, "corner {corner} vs {expect}");
     }
 }

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use heightfield_core::kernel::{BlendOptions, Kernel, blend};
 use heightfield_core::loft::{Profile, match_profiles, ruled_triangles};
-use heightfield_core::raster::{P3, include_cap, include_triangles, triangulate_loop};
+use heightfield_core::raster::{P3, include_cap_labelled, include_triangles_labelled, triangulate_loop};
 use heightfield_core::{Body, FaceSel, Grid, Op, Prism, Side, Solid};
 use onshape_import_core::sketch3d::Frame;
 use sketch_regions_core::{Curve, Piece, Region, arrange, difference, union};
@@ -53,6 +53,9 @@ pub struct Exec {
     pub wall_jump: f32,
     /// Chord tolerance for flattening arcs into loft profiles (m).
     pub chord_tol: f64,
+    /// Columns emptied / changed by the last apply (footprint bookkeeping).
+    pub last_emptied: usize,
+    pub last_changed: usize,
 }
 
 fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -99,8 +102,13 @@ fn region_to_world_xy(region: &Region, frame: &Frame) -> Vec<Region> {
 }
 
 impl Exec {
+    /// Cell labels are `feature index * 16 + face`: face 0 is a feature's
+    /// cap (or its only surface), face 1 a loft's side surface.
+    pub const FACE_CAP: u32 = 0;
+    pub const FACE_SIDE: u32 = 1;
+
     pub fn new(grid: Grid, sketches: Vec<SolvedSketch>, planned: &[Planned]) -> Exec {
-        let labels = planned.iter().map(|p| (p.feature_id.clone(), p.index as u32)).collect();
+        let labels = planned.iter().map(|p| (p.feature_id.clone(), p.index as u32 * 16)).collect();
         Exec {
             grid,
             sketches: sketches.into_iter().map(|s| (s.feature_id.clone(), s)).collect(),
@@ -112,6 +120,8 @@ impl Exec {
             blend_options: BlendOptions::default(),
             wall_jump: 1e-4,
             chord_tol: 2e-5,
+            last_emptied: 0,
+            last_changed: 0,
         }
     }
 
@@ -127,6 +137,7 @@ impl Exec {
         match f.role {
             FaceRole::Outline => FaceSel::Outline,
             FaceRole::Wall => FaceSel::Wall(self.label(&f.feature)),
+            FaceRole::Loft => FaceSel::Cap(self.label(&f.feature) + Self::FACE_SIDE),
             _ => FaceSel::Cap(self.label(&f.feature)),
         }
     }
@@ -150,19 +161,27 @@ impl Exec {
     }
 
     /// Sweep extents along `dir` for the bounds, from the plane origin.
-    fn sweep(&self, origin: [f64; 3], dir: [f64; 3], end: &Bound, second: &Option<Bound>) -> Result<(f64, f64), String> {
+    /// An up-to-vertex bound ends at the plane through the vertex parallel
+    /// to the sketch plane (`normal`), whatever the sweep direction.
+    fn sweep(&self, origin: [f64; 3], normal: [f64; 3], dir: [f64; 3], end: &Bound, second: &Option<Bound>) -> Result<(f64, f64), String> {
         let along = |b: &Bound| -> Result<f64, String> {
             Ok(match b {
                 Bound::Blind(d) => *d,
                 Bound::ThroughAll => f64::INFINITY,
-                Bound::UpToPlane { origin: po, normal } => {
-                    let den = dot3(dir, *normal);
+                Bound::UpToPlane { origin: po, normal: pn } => {
+                    let den = dot3(dir, *pn);
                     if den.abs() < 1e-9 {
-                        return Err("up-to plane is parallel to the sweep".into());
+                        return Err(format!("up-to plane (normal {pn:?}) is parallel to the sweep {dir:?}"));
                     }
-                    dot3(sub3(*po, origin), *normal) / den
+                    dot3(sub3(*po, origin), *pn) / den
                 }
-                Bound::UpToPoint(p) => dot3(sub3(*p, origin), dir),
+                Bound::UpToPoint(p) => {
+                    let den = dot3(dir, normal);
+                    if den.abs() < 1e-9 {
+                        return Err("sweep direction lies in the sketch plane".into());
+                    }
+                    dot3(sub3(*p, origin), normal) / den
+                }
             })
         };
         let e = along(end)?;
@@ -176,10 +195,14 @@ impl Exec {
     }
 
     fn apply_to_targets(&mut self, targets: &[String], body: &Body, op: Op, label: u32) -> String {
+        self.last_emptied = 0;
+        self.last_changed = 0;
         let mut summary = Vec::new();
         for t in targets {
             let solid = self.bodies.get_mut(t).unwrap();
             let rep = solid.apply_body(body, op, label, label);
+            self.last_emptied += rep.emptied;
+            self.last_changed += rep.cells_changed;
             summary.push(format!("{} cells{}{}", rep.cells_changed, if rep.split_columns > 0 { format!(", {} split", rep.split_columns) } else { String::new() }, if rep.emptied > 0 { format!(", {} emptied", rep.emptied) } else { String::new() }));
         }
         summary.join("; ")
@@ -189,17 +212,26 @@ impl Exec {
         if regions.is_empty() {
             return Err("no regions".into());
         }
-        let label = p.index as u32;
+        let label = p.index as u32 * 16;
         let mut body = Body::empty(&self.grid);
         let mut footprint: Vec<Region> = Vec::new();
         let mut horizontal = true;
+        let mut sweep_desc = String::new();
+        let mut missing = Vec::new();
         for sel in regions {
-            let (sk, region) = self.region_of(sel)?;
+            let (sk, region) = match self.region_of(sel) {
+                Ok(x) => x,
+                Err(e) => {
+                    missing.push(e);
+                    continue;
+                }
+            };
             let mut dir = direction.unwrap_or(sk.normal);
             if flip {
                 dir = [-dir[0], -dir[1], -dir[2]];
             }
-            let (w0, w1) = self.sweep(sk.frame.origin, dir, end, second)?;
+            let (w0, w1) = self.sweep(sk.frame.origin, sk.normal, dir, end, second)?;
+            sweep_desc = format!("sketch {} normal ({:.2},{:.2},{:.2}) dir ({:.2},{:.2},{:.2}) w [{:.4}, {:.4}] m", sk.name, sk.normal[0], sk.normal[1], sk.normal[2], dir[0], dir[1], dir[2], w0, w1);
             let prism = Prism { region: region.clone(), origin: sk.frame.origin, u: sk.frame.ex, v: sk.frame.ey, dir, w0, w1 };
             let pb = prism.body(&self.grid);
             for k in 0..self.grid.len() {
@@ -213,6 +245,10 @@ impl Exec {
                 horizontal = false;
             }
         }
+        if missing.len() == regions.len() {
+            return Err(missing.join("; "));
+        }
+        let missing_note = if missing.is_empty() { String::new() } else { format!("; MISSING {} of {} regions: {}", missing.len(), regions.len(), missing.join("; ")) };
         match op {
             BoolOp::New => {
                 let mut solid = Solid::empty(self.grid.clone());
@@ -229,20 +265,32 @@ impl Exec {
             BoolOp::Add | BoolOp::Remove => {
                 let targets = self.targets_of(targets)?;
                 let hf_op = if op == BoolOp::Add { Op::Add } else { Op::Remove };
-                let s = self.apply_to_targets(&targets, &body, hf_op, label);
+                let mut s = self.apply_to_targets(&targets, &body, hf_op, label);
+                // A true through cut empties every column it touches.
+                let emptied_any = self.last_emptied > 0 && self.last_emptied == self.last_changed;
                 // Keep the exact footprint in step with horizontal sweeps.
                 if horizontal {
                     for t in &targets {
                         let solid = self.bodies.get_mut(t).unwrap();
                         if let Some(outline) = solid.outline.take() {
-                            solid.outline = Some(match (op, end, second) {
-                                (BoolOp::Add, _, _) => union(&outline, &footprint, 1e-7),
-                                (BoolOp::Remove, Bound::ThroughAll, _) | (BoolOp::Remove, _, Some(Bound::ThroughAll)) => difference(&outline, &footprint, 1e-7),
+                            let before: f64 = outline.iter().map(|r| r.area).sum();
+                            // A cut leaves the footprint only where it emptied
+                            // columns (a blind pocket with a through-all second
+                            // direction into empty air is still a pocket).
+                            let new_outline = match (op, emptied_any) {
+                                (BoolOp::Add, _) => union(&outline, &footprint, 1e-7),
+                                (BoolOp::Remove, true) => difference(&outline, &footprint, 1e-7),
                                 _ => outline,
-                            });
+                            };
+                            let after: f64 = new_outline.iter().map(|r| r.area).sum();
+                            if (after - before).abs() > 1e-12 {
+                                s.push_str(&format!("; outline {:.5} -> {:.5} m2 ({} regions)", before, after, new_outline.len()));
+                            }
+                            solid.outline = Some(new_outline);
                         }
                     }
                 }
+                s.push_str(&format!("; {sweep_desc}{missing_note}"));
                 Ok(s)
             }
             BoolOp::Intersect => Err("intersect extrude".into()),
@@ -271,30 +319,67 @@ impl Exec {
         triangulate_loop(&pts2).into_iter().map(|[a, b, c]| [prof.points[a], prof.points[b], prof.points[c]]).collect()
     }
 
-    fn run_loft(&mut self, p: &Planned, profiles: &[RegionSel], op: BoolOp, targets: &[String]) -> Result<String, String> {
+    /// A profile is one or more regions of one sketch; several merge into
+    /// one face by union.
+    fn profile_region(&self, sels: &[RegionSel]) -> Result<(&SolvedSketch, Region), String> {
+        let mut regions: Vec<Region> = Vec::new();
+        let mut sketch: Option<&SolvedSketch> = None;
+        let mut missing = Vec::new();
+        for sel in sels {
+            match self.region_of(sel) {
+                Ok((sk, r)) => {
+                    if sketch.is_some_and(|s| s.feature_id != sk.feature_id) {
+                        return Err("profile regions from different sketches".into());
+                    }
+                    sketch = Some(sk);
+                    regions.push(r.clone());
+                }
+                Err(e) => missing.push(e),
+            }
+        }
+        let sk = sketch.ok_or_else(|| format!("profile without regions: {}", missing.join("; ")))?;
+        let merged = if regions.len() == 1 {
+            regions.pop().unwrap()
+        } else {
+            let mut acc = vec![regions[0].clone()];
+            for r in &regions[1..] {
+                acc = union(&acc, std::slice::from_ref(r), 1e-7);
+            }
+            if acc.len() != 1 {
+                return Err(format!("profile regions do not merge into one face ({} pieces)", acc.len()));
+            }
+            acc.pop().unwrap()
+        };
+        Ok((sk, merged))
+    }
+
+    fn run_loft(&mut self, p: &Planned, profiles: &[Vec<RegionSel>], op: BoolOp, targets: &[String]) -> Result<String, String> {
         if profiles.len() != 2 {
             return Err(format!("loft with {} profiles", profiles.len()));
         }
-        let (sa, ra) = self.region_of(&profiles[0])?;
-        let (sb, rb) = self.region_of(&profiles[1])?;
+        let (sa, ra) = self.profile_region(&profiles[0])?;
+        let (sb, rb) = self.profile_region(&profiles[1])?;
+        let (ra, rb) = (&ra, &rb);
         let pa = self.profile_of(sa, ra);
         let pb = self.profile_of(sb, rb);
         let (qa, qb) = match_profiles(&pa, &pb, 48);
-        let mut tris = ruled_triangles(&qa, &qb);
+        let label = p.index as u32 * 16;
+        let side_tris = ruled_triangles(&qa, &qb);
         let mut body = Body::empty(&self.grid);
+        let mut cap_tris = Vec::new();
         for (sk, r) in [(sa, ra), (sb, rb)] {
             if sk.normal[2].abs() > 1.0 - 1e-9 {
                 // Horizontal cap: exact region test at the plane height.
                 let world = region_to_world_xy(r, &sk.frame);
                 for w in &world {
-                    include_cap(&mut body, w, sk.frame.origin[2]);
+                    include_cap_labelled(&mut body, w, sk.frame.origin[2], Some(label + Self::FACE_CAP));
                 }
             } else {
-                tris.extend(self.cap_triangles(sk, r));
+                cap_tris.extend(self.cap_triangles(sk, r));
             }
         }
-        include_triangles(&mut body, &tris);
-        let label = p.index as u32;
+        include_triangles_labelled(&mut body, &cap_tris, Some(label + Self::FACE_CAP));
+        include_triangles_labelled(&mut body, &side_tris, Some(label + Self::FACE_SIDE));
         match op {
             BoolOp::New => {
                 let mut solid = Solid::empty(self.grid.clone());
@@ -314,9 +399,25 @@ impl Exec {
         }
     }
 
+    /// The body holding cells labelled by `feature` (a tool body before its
+    /// boolean), else the main body.
+    fn body_for(&self, feature: &str) -> Option<String> {
+        let l = self.label(feature) / 16;
+        for (fid, solid) in &self.bodies {
+            if Some(fid) == self.main.as_ref() {
+                continue;
+            }
+            if solid.top_label.iter().zip(solid.top.iter()).any(|(&lab, &t)| !t.is_nan() && lab / 16 == l) {
+                return Some(fid.clone());
+            }
+        }
+        self.main.clone()
+    }
+
     fn run_blend(&mut self, p: &Planned, edges: &[EdgeSel], kernel: Kernel) -> Result<String, String> {
-        let main = self.main.clone().ok_or("no body")?;
-        let label = p.index as u32;
+        let owner = edges.iter().flat_map(|e| [&e.a.feature, &e.b.feature]).find(|f| !f.is_empty()).cloned().unwrap_or_default();
+        let main = self.body_for(&owner).ok_or("no body")?;
+        let label = p.index as u32 * 16;
         let mut parts = Vec::new();
         let mut failures = Vec::new();
         for e in edges {
@@ -325,11 +426,37 @@ impl Exec {
             let side = if e.side == SideRef::Top { Side::Top } else { Side::Bottom };
             let vertical = !matches!(a, FaceSel::Cap(_) | FaceSel::AnyCap) && !matches!(b, FaceSel::Cap(_) | FaceSel::AnyCap);
             if vertical {
-                failures.push(format!("vertical edge {:?}/{:?} not implemented", e.a.role, e.b.role));
+                match self.run_vertical_blend(&main, e, kernel.radius(), label) {
+                    Ok(s) => parts.push(s),
+                    Err(err) => failures.push(err),
+                }
                 continue;
             }
             let solid = self.bodies.get_mut(&main).unwrap();
-            let cells = solid.edge_cells(side, a, b, self.wall_jump);
+            let mut cells = solid.edge_cells(side, a, b, self.wall_jump);
+            // A wall on the footprint boundary has no cells across it: it is
+            // the outline wall.
+            if cells.cells.is_empty() && matches!(b, FaceSel::Wall(_)) {
+                cells = solid.edge_cells(side, a, FaceSel::Outline, self.wall_jump);
+            }
+            if cells.cells.is_empty() && matches!(a, FaceSel::Wall(_)) {
+                cells = solid.edge_cells(side, FaceSel::Outline, b, self.wall_jump);
+            }
+            if let Some(hb) = e.hint_box {
+                // Keep the cells around the blend face (grown by the reach of
+                // the kernel plus a margin).
+                let g = &solid.grid;
+                let m = kernel.radius() * 2.0 + 4.0 * g.pitch;
+                let keep: Vec<usize> = (0..cells.cells.len())
+                    .filter(|&q| {
+                        let (i, j) = g.ij(cells.cells[q]);
+                        let (x, y) = (g.x(i), g.y(j));
+                        x >= hb[0] - m && x <= hb[3] + m && y >= hb[1] - m && y <= hb[4] + m
+                    })
+                    .collect();
+                cells.cells = keep.iter().map(|&q| cells.cells[q]).collect();
+                cells.across = keep.iter().map(|&q| cells.across[q]).collect();
+            }
             if cells.cells.is_empty() {
                 failures.push(format!("edge {}:{:?} / {}:{:?} has no cells", e.a.feature, e.a.role, e.b.feature, e.b.role));
                 continue;
@@ -346,13 +473,76 @@ impl Exec {
         Ok(parts.join("; "))
     }
 
+    /// A vertical edge: round the corner of the region it belongs to in
+    /// plan view. The region is the footprint (both faces on the outline),
+    /// else the cells of the wall's owner (a pocket floor or a boss top),
+    /// else the hole the owner cut through (no cells).
+    fn run_vertical_blend(&mut self, main: &str, e: &EdgeSel, r: f64, label: u32) -> Result<String, String> {
+        let hb = e.hint_box.ok_or("vertical edge without a location")?;
+        let bbox = [hb[0], hb[1], hb[3], hb[4]];
+        let solid = self.bodies.get_mut(main).unwrap();
+        let g = solid.grid.clone();
+        let side = if e.side == SideRef::Top { Side::Top } else { Side::Bottom };
+        let both_outline = e.a.role == FaceRole::Outline && e.b.role == FaceRole::Outline;
+        let owner = [&e.a, &e.b].into_iter().find(|f| f.role == FaceRole::Wall).map(|f| self.labels.get(&f.feature).copied().unwrap_or(u32::MAX));
+        if both_outline {
+            // Exact: round line-line corners of the outline inside the box,
+            // then drop the columns that fell outside.
+            let mut rounded = 0;
+            if let Some(outline) = solid.outline.as_mut() {
+                for reg in outline.iter_mut() {
+                    let n = reg.outer.len();
+                    let mut k = 0;
+                    while k < reg.outer.len() && rounded < 4 * n {
+                        let corner = reg.outer[k].curve.end();
+                        let inside = corner[0] >= bbox[0] - 2.0 * g.pitch && corner[0] <= bbox[2] + 2.0 * g.pitch && corner[1] >= bbox[1] - 2.0 * g.pitch && corner[1] <= bbox[3] + 2.0 * g.pitch;
+                        if inside && sketch_regions_core::fillet_corner(&mut reg.outer, k, r, "fillet") {
+                            rounded += 1;
+                            k += 2;
+                        } else {
+                            k += 1;
+                        }
+                    }
+                    reg.ids.insert("fillet".into());
+                }
+            }
+            let mask = solid.mask();
+            let rep = heightfield_core::vertical::round_mask(solid, side, &mask, r, bbox, true, label, label);
+            let clipped = solid.clip_to_outline();
+            let outline_desc = solid.outline.as_ref().map(|o| o.iter().map(|r| format!("{:.4}m2/{}p/{}h", r.area, r.outer.len(), r.holes.len())).collect::<Vec<_>>().join(",")).unwrap_or_default();
+            return Ok(format!("footprint corner: {} outline corners rounded, {} cells removed, {} clipped; outline [{}]", rounded, rep.removed, clipped, outline_desc));
+        }
+        let owner = owner.ok_or("vertical edge without a wall owner")?;
+        let field_label = match side {
+            Side::Top => &solid.top_label,
+            Side::Bottom => &solid.bot_label,
+        };
+        let (i0, i1, j0, j1) = g.cells_in([bbox[0] - g.pitch, bbox[1] - g.pitch, bbox[2] + g.pitch, bbox[3] + g.pitch]);
+        let mut mask: Vec<bool> = field_label.iter().zip(solid.top.iter()).map(|(&l, &t)| !t.is_nan() && l / 16 == owner / 16).collect();
+        let mut any = false;
+        for j in j0..j1 {
+            for i in i0..i1 {
+                any |= mask[g.idx(i, j)];
+            }
+        }
+        let kind = if any {
+            "owner cells"
+        } else {
+            // A through cut: the hole itself.
+            mask = solid.top.iter().map(|t| t.is_nan()).collect();
+            "hole"
+        };
+        let rep = heightfield_core::vertical::round_mask(solid, side, &mask, r, bbox, false, label, label);
+        Ok(format!("plan corner ({kind}): {} cells removed, {} added", rep.removed, rep.added))
+    }
+
     fn run_boolean(&mut self, p: &Planned, op: BoolOp, tools: &[String], targets: &[String]) -> Result<String, String> {
         let targets = self.targets_of(targets)?;
-        let label = p.index as u32;
+        let label = p.index as u32 * 16;
         let mut summary = Vec::new();
         for tool in tools {
             let ts = self.bodies.remove(tool).ok_or_else(|| format!("tool body of feature {tool} does not exist"))?;
-            let body = Body { grid: ts.grid.clone(), lo: ts.bot.clone(), hi: ts.top.clone() };
+            let body = Body { grid: ts.grid.clone(), lo: ts.bot.clone(), hi: ts.top.clone(), hi_label: None, lo_label: None };
             let hf_op = match op {
                 BoolOp::Add => Op::Add,
                 BoolOp::Remove => Op::Remove,

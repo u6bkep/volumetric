@@ -50,6 +50,8 @@ pub struct BlendReport {
     /// than the ball); they keep their height.
     pub vanished: usize,
     pub edge_cells: usize,
+    /// Ball positions that touch both faces of the edge.
+    pub valid_centres: usize,
 }
 
 /// Options for [`blend`].
@@ -116,67 +118,136 @@ pub fn blend(
     for &k in &edge.cells {
         is_edge[k] = true;
     }
-    let (d2, _) = edt::distance_to_sites(nx, ny, |k| is_edge[k]);
+    // The two faces the ball must touch: the labels on the edge cells and
+    // on the cells across the edge (none across = the footprint wall).
+    let labels: &[u32] = match side {
+        Side::Top => &solid.top_label,
+        Side::Bottom => &solid.bot_label,
+    };
+    let label_a: std::collections::HashSet<u32> = edge.cells.iter().map(|&k| labels[k]).collect();
+    let label_b: std::collections::HashSet<u32> = edge.across.iter().filter(|&&n| !h[n].is_nan()).map(|&n| labels[n]).collect();
+    let (d2, nearest_edge) = edt::distance_to_sites(nx, ny, |k| is_edge[k]);
     let rc = kernel.radius() / g.pitch;
     let write_r = rc * opts.band_factor + 1.0;
     let centre_r = write_r + rc + 1.0;
     let dsc = disc(kernel, g.pitch);
+    // Height tolerance for "the ball touches this cell": the discrete disc's
+    // error on a sloped face is about a cell of height per unit slope.
+    let tol = 3.0 * g.pitch as f32;
 
     // Pass 1: the resting-ball centre heights (dilation for a closing,
-    // erosion for an opening) at every cell within reach of the band.
-    let first = |k: usize| -> f32 {
+    // erosion for an opening) at every cell within reach of the band, with
+    // the cells the ball touches on each face. A ball counts when it touches
+    // face A (a cell of A's label attains the extremum) and face B (likewise,
+    // or, for a wall or the footprint wall, which have no cells of their
+    // own, when the centre sits at the kernel's reach from the edge; the
+    // contact is then the nearest edge cell).
+    let first = |k: usize| -> (f32, u32, u32) {
         let (i, j) = g.ij(k);
         let mut acc = if convex { f32::INFINITY } else { f32::NEG_INFINITY };
+        let mut best_a = (if convex { f32::INFINITY } else { f32::NEG_INFINITY }, u32::MAX);
+        let mut best_b = best_a;
         let mut any = false;
         for &(di, dj, kv) in &dsc.offsets {
             let (ii, jj) = (i as isize + di, j as isize + dj);
-            let v = if ii < 0 || jj < 0 || ii >= nx as isize || jj >= ny as isize {
-                f32::NAN
+            let (v, l, q) = if ii < 0 || jj < 0 || ii >= nx as isize || jj >= ny as isize {
+                (f32::NAN, u32::MAX, usize::MAX)
             } else {
-                h[g.idx(ii as usize, jj as usize)]
+                let q = g.idx(ii as usize, jj as usize);
+                (h[q], labels[q], q)
             };
             if convex {
-                // The ball must fit under the surface everywhere it reaches:
-                // an empty column means it cannot rest here at all.
                 if v.is_nan() {
-                    return f32::NEG_INFINITY;
+                    return (f32::NEG_INFINITY, u32::MAX, u32::MAX);
                 }
-                acc = acc.min(v - kv as f32);
+                let e = v - kv as f32;
+                acc = acc.min(e);
+                if label_a.contains(&l) && e < best_a.0 {
+                    best_a = (e, q as u32);
+                }
+                if label_b.contains(&l) && e < best_b.0 {
+                    best_b = (e, q as u32);
+                }
                 any = true;
             } else if !v.is_nan() {
-                acc = acc.max(v + kv as f32);
+                let e = v + kv as f32;
+                acc = acc.max(e);
+                if label_a.contains(&l) && e > best_a.0 {
+                    best_a = (e, q as u32);
+                }
+                if label_b.contains(&l) && e > best_b.0 {
+                    best_b = (e, q as u32);
+                }
                 any = true;
             }
         }
-        if any { acc } else { f32::NAN }
+        if !any {
+            return (f32::NAN, u32::MAX, u32::MAX);
+        }
+        let a_ok = best_a.1 != u32::MAX && (best_a.0 - acc).abs() <= tol;
+        let dist_ok = ((d2[k].sqrt() - rc) as f32).abs() <= 1.5;
+        let (b_ok, b_cell) = if edge.b_has_cells && !label_b.is_empty() {
+            (best_b.1 != u32::MAX && (best_b.0 - acc).abs() <= tol, best_b.1)
+        } else {
+            (dist_ok, if nearest_edge[k] == usize::MAX { u32::MAX } else { nearest_edge[k] as u32 })
+        };
+        if a_ok && b_ok { (acc, best_a.1, b_cell) } else { (f32::NAN, u32::MAX, u32::MAX) }
     };
     let centre_cells: Vec<usize> = (0..g.len()).filter(|&k| d2[k].sqrt() <= centre_r).collect();
-    let centre_vals: Vec<f32> = map_par(&centre_cells, |&k| first(k));
+    let centre_vals: Vec<(f32, u32, u32)> = map_par(&centre_cells, |&k| first(k));
     let mut stage = vec![f32::NAN; g.len()];
-    for (k, v) in centre_cells.iter().zip(centre_vals) {
-        stage[*k] = v;
+    let mut contact = vec![(u32::MAX, u32::MAX); g.len()];
+    let mut valid_count = 0usize;
+    for (k, (v, ca, cb)) in centre_cells.iter().zip(centre_vals) {
+        if v.is_finite() {
+            stage[*k] = v;
+            contact[*k] = (ca, cb);
+            valid_count += 1;
+        }
     }
+    rep.valid_centres = valid_count;
 
-    // Pass 2: the swept surface at the band cells.
+    // Pass 2: the swept surface at the band cells, from the valid balls
+    // only, and only along the span between a ball's two contacts (the
+    // part of the ball that is the blend).
     let second = |k: usize| -> f32 {
         if h[k].is_nan() {
             return f32::NAN;
         }
         let (i, j) = g.ij(k);
+        let (px, py) = (i as f64, j as f64);
         let mut acc = if convex { f32::NEG_INFINITY } else { f32::INFINITY };
         for &(di, dj, kv) in &dsc.offsets {
             let (ii, jj) = (i as isize + di, j as isize + dj);
             if ii < 0 || jj < 0 || ii >= nx as isize || jj >= ny as isize {
                 continue;
             }
-            let c = stage[g.idx(ii as usize, jj as usize)];
+            let q = g.idx(ii as usize, jj as usize);
+            let c = stage[q];
             if c.is_nan() {
                 continue;
             }
+            let (ca, cb) = contact[q];
+            if ca == u32::MAX || cb == u32::MAX {
+                continue;
+            }
+            let (ax, ay) = g.ij(ca as usize);
+            let (bx, by) = g.ij(cb as usize);
+            let (ax, ay, bx, by) = (ax as f64, ay as f64, bx as f64, by as f64);
+            let (ex, ey) = (bx - ax, by - ay);
+            let l2 = ex * ex + ey * ey;
+            let inside = if l2 < 0.25 {
+                (px - ax).powi(2) + (py - ay).powi(2) <= 1.0
+            } else {
+                let t = ((px - ax) * ex + (py - ay) * ey) / l2;
+                let perp = ((px - ax) * ey - (py - ay) * ex).abs() / l2.sqrt();
+                (-0.1..=1.1).contains(&t) && perp <= 1.0
+            };
+            if !inside {
+                continue;
+            }
             if convex {
-                if c.is_finite() {
-                    acc = acc.max(c + kv as f32);
-                }
+                acc = acc.max(c + kv as f32);
             } else {
                 acc = acc.min(c - kv as f32);
             }

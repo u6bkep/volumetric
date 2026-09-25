@@ -20,6 +20,7 @@
 
 pub mod edt;
 pub mod kernel;
+pub mod vertical;
 pub mod loft;
 pub mod payload;
 pub mod raster;
@@ -90,11 +91,41 @@ pub struct Body {
     pub grid: Grid,
     pub lo: Vec<f32>,
     pub hi: Vec<f32>,
+    /// Optional per-column labels for the upper and lower surfaces (which
+    /// face of the body they are), used instead of the operation's label
+    /// when present.
+    pub hi_label: Option<Vec<u32>>,
+    pub lo_label: Option<Vec<u32>>,
 }
 
 impl Body {
     pub fn empty(grid: &Grid) -> Body {
-        Body { grid: grid.clone(), lo: vec![f32::NAN; grid.len()], hi: vec![f32::NAN; grid.len()] }
+        Body { grid: grid.clone(), lo: vec![f32::NAN; grid.len()], hi: vec![f32::NAN; grid.len()], hi_label: None, lo_label: None }
+    }
+    /// Widen column `k` to include `z` and remember which face set the
+    /// extreme it changed.
+    #[inline]
+    pub fn include_labelled(&mut self, k: usize, z: f32, label: u32) {
+        if self.hi_label.is_none() {
+            self.hi_label = Some(vec![u32::MAX; self.grid.len()]);
+            self.lo_label = Some(vec![u32::MAX; self.grid.len()]);
+        }
+        let (hl, ll) = (self.hi_label.as_mut().unwrap(), self.lo_label.as_mut().unwrap());
+        if self.lo[k].is_nan() {
+            self.lo[k] = z;
+            self.hi[k] = z;
+            hl[k] = label;
+            ll[k] = label;
+        } else {
+            if z > self.hi[k] {
+                self.hi[k] = z;
+                hl[k] = label;
+            }
+            if z < self.lo[k] {
+                self.lo[k] = z;
+                ll[k] = label;
+            }
+        }
     }
     /// Widen column `k` to include `z`.
     #[inline]
@@ -188,13 +219,15 @@ impl Solid {
             if lo.is_nan() {
                 continue;
             }
+            let pick = |labels: &Option<Vec<u32>>| labels.as_ref().map(|l| l[k]).filter(|&l| l != u32::MAX).unwrap_or(label);
+            let (hi_label, lo_label) = (pick(&body.hi_label), pick(&body.lo_label));
             match op {
                 Op::Add => {
                     if !self.has_material(k) {
                         self.top[k] = hi;
                         self.bot[k] = lo;
-                        self.top_label[k] = label;
-                        self.bot_label[k] = label;
+                        self.top_label[k] = hi_label;
+                        self.bot_label[k] = lo_label;
                         self.top_order[k] = order;
                         self.bot_order[k] = order;
                         rep.cells_changed += 1;
@@ -207,13 +240,13 @@ impl Solid {
                     let mut changed = false;
                     if hi > t {
                         self.top[k] = hi;
-                        self.top_label[k] = label;
+                        self.top_label[k] = hi_label;
                         self.top_order[k] = order;
                         changed = true;
                     }
                     if lo < b {
                         self.bot[k] = lo;
-                        self.bot_label[k] = label;
+                        self.bot_label[k] = lo_label;
                         self.bot_order[k] = order;
                         changed = true;
                     }
@@ -239,11 +272,11 @@ impl Solid {
                         rep.split_columns += 1;
                         if t - hi >= lo - b {
                             self.bot[k] = hi;
-                            self.bot_label[k] = label;
+                            self.bot_label[k] = hi_label;
                             self.bot_order[k] = order;
                         } else {
                             self.top[k] = lo;
-                            self.top_label[k] = label;
+                            self.top_label[k] = lo_label;
                             self.top_order[k] = order;
                         }
                         rep.cells_changed += 1;
@@ -251,11 +284,11 @@ impl Solid {
                     }
                     if hi >= t {
                         self.top[k] = lo;
-                        self.top_label[k] = label;
+                        self.top_label[k] = lo_label;
                         self.top_order[k] = order;
                     } else {
                         self.bot[k] = hi;
-                        self.bot_label[k] = label;
+                        self.bot_label[k] = hi_label;
                         self.bot_order[k] = order;
                     }
                     rep.cells_changed += 1;
@@ -269,6 +302,29 @@ impl Solid {
     pub fn extrude(&mut self, prism: &Prism, op: Op, label: u32, order: u32) -> OpReport {
         let body = prism.body(&self.grid);
         self.apply_body(&body, op, label, order)
+    }
+
+    /// Empty every column whose centre lies outside the exact outline (after
+    /// the outline changed). Returns the number of columns emptied.
+    pub fn clip_to_outline(&mut self) -> usize {
+        let Some(outline) = self.outline.clone() else { return 0 };
+        let g = self.grid.clone();
+        let mut n = 0;
+        for j in 0..g.ny {
+            for i in 0..g.nx {
+                let k = g.idx(i, j);
+                if self.top[k].is_nan() {
+                    continue;
+                }
+                let p = [g.x(i), g.y(j)];
+                if !outline.iter().any(|r| r.contains(p)) {
+                    self.top[k] = f32::NAN;
+                    self.bot[k] = f32::NAN;
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     /// Fill the heights of empty columns from the nearest filled column so
@@ -478,6 +534,9 @@ pub struct EdgeCells {
     /// Whether the solid is convex across the edge (a ridge / the top of a
     /// wall) as opposed to concave (a valley / the foot of a wall).
     pub convex: bool,
+    /// Whether the second face has cells of its own (a cap) rather than
+    /// being a wall or the footprint wall.
+    pub b_has_cells: bool,
 }
 
 const NEIGHBOURS: [(isize, isize); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
@@ -507,7 +566,7 @@ impl Solid {
         let g = &self.grid;
         let (h, label, order) = self.field(side);
         let sign = if side == Side::Top { 1.0f32 } else { -1.0 };
-        let mut out = EdgeCells::default();
+        let mut out = EdgeCells { b_has_cells: matches!(other, FaceSel::Cap(_) | FaceSel::AnyCap), ..Default::default() };
         let mut convex_votes: i64 = 0;
         for j in 0..g.ny {
             for i in 0..g.nx {

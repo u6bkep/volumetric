@@ -39,6 +39,9 @@ pub struct EdgeSel {
     pub b: FaceRef,
     pub side: SideRef,
     pub hint: Option<[f64; 3]>,
+    /// Bounding box of the blend face at the resolved configuration
+    /// (model frame, metres): edge cells are taken from around it.
+    pub hint_box: Option<[f64; 6]>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,7 +58,8 @@ pub enum Step {
         targets: Vec<String>,
     },
     Loft {
-        profiles: Vec<RegionSel>,
+        /// One entry per profile; a profile is the union of its regions.
+        profiles: Vec<Vec<RegionSel>>,
         op: BoolOp,
         targets: Vec<String>,
     },
@@ -175,9 +179,13 @@ pub fn is_suppressed(feature: &Json, cfg: &HashMap<String, Value>, scope: &dyn S
             Ok(m["suppressed"].as_bool().unwrap_or(false))
         }
         Some("BTMSuppressionStateExpression") => {
+            // An expression that fails to evaluate (an undefined variable)
+            // leaves the feature in an error state in Onshape: not applied.
             let e = ss["message"]["value"]["message"]["expression"].as_str().unwrap_or("true");
-            let v = fs_expr::evaluate(e, scope).map_err(|err| format!("suppression {e}: {}", err.0))?;
-            Ok(!v.as_bool().map_err(|err| format!("suppression {e}: {}", err.0))?)
+            match fs_expr::evaluate(e, scope).and_then(|v| v.as_bool()) {
+                Ok(active) => Ok(!active),
+                Err(_) => Ok(true),
+            }
         }
         _ => Ok(m["suppressed"].as_bool().unwrap_or(false)),
     }
@@ -185,57 +193,97 @@ pub fn is_suppressed(feature: &Json, cfg: &HashMap<String, Value>, scope: &dyn S
 
 struct Resolver<'a> {
     table: &'a IdTable,
+    feature: String,
     unresolved: Vec<String>,
 }
 
+/// `(parameter, query index, id index, id)` for every id of a query-list
+/// parameter.
+fn slot_ids(feature: &Json, param_id: &str) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    for (qi, (_, ids)) in query_ids(feature, param_id).into_iter().enumerate() {
+        for (ii, id) in ids.into_iter().enumerate() {
+            out.push((qi, ii, id));
+        }
+    }
+    out
+}
+
 impl Resolver<'_> {
-    fn get(&mut self, id: &str) -> Option<Ref> {
-        match self.table.get(id) {
+    fn get_slot(&mut self, param: &str, qi: usize, ii: usize, id: &str) -> Option<Ref> {
+        let key = IdTable::slot_key(&self.feature, param, qi, ii);
+        match self.table.lookup(&key, id) {
             Some(Ref::Unresolved { .. }) | None => {
-                self.unresolved.push(id.to_string());
+                self.unresolved.push(if id.is_empty() { key } else { id.to_string() });
                 None
             }
             Some(r) => Some(r.clone()),
         }
     }
 
-    fn regions(&mut self, qs: &[(Option<String>, Vec<String>)]) -> Vec<RegionSel> {
+    fn get(&mut self, param: &str, qi: usize, ii: usize, id: &str) -> Option<Ref> {
+        self.get_slot(param, qi, ii, id)
+    }
+
+    /// First id of a parameter (a single-entity query).
+    fn first(&mut self, feature: &Json, param: &str) -> Option<Ref> {
+        let ids = slot_ids(feature, param);
+        let (qi, ii, id) = ids.first().cloned().unwrap_or((0, 0, String::new()));
+        self.get(param, qi, ii, &id)
+    }
+
+    fn regions_of(&mut self, feature: &Json, param: &str) -> Vec<RegionSel> {
         let mut out = Vec::new();
-        for (_, ids) in qs {
-            for id in ids {
-                if let Some(Ref::Region { sketch, ids }) = self.get(id) {
-                    out.push(RegionSel { sketch, ids });
-                } else if self.table.get(id).is_some() {
-                    self.unresolved.push(format!("{id} (not a region)"));
+        for (qi, ii, id) in slot_ids(feature, param) {
+            match self.get(param, qi, ii, &id) {
+                Some(Ref::Region { sketch, ids }) => out.push(RegionSel { sketch, ids }),
+                Some(_) => self.unresolved.push(format!("{id} (not a region)")),
+                None => {}
+            }
+        }
+        out
+    }
+
+    fn regions_in(&mut self, param: &str, qs: &[(Option<String>, Vec<String>)], q_offset: usize) -> Vec<RegionSel> {
+        let mut out = Vec::new();
+        for (qi, (_, ids)) in qs.iter().enumerate() {
+            for (ii, id) in ids.iter().enumerate() {
+                match self.get(param, qi + q_offset, ii, id) {
+                    Some(Ref::Region { sketch, ids }) => out.push(RegionSel { sketch, ids }),
+                    Some(_) => self.unresolved.push(format!("{id} (not a region)")),
+                    None => {}
                 }
             }
         }
         out
     }
 
-    fn bodies(&mut self, qs: &[(Option<String>, Vec<String>)]) -> Vec<String> {
+    fn bodies_of(&mut self, feature: &Json, param: &str) -> Vec<String> {
         let mut out = Vec::new();
-        for (_, ids) in qs {
-            for id in ids {
-                if let Some(Ref::Body { feature }) = self.get(id) {
-                    out.push(feature);
-                } else if self.table.get(id).is_some() {
-                    self.unresolved.push(format!("{id} (not a body)"));
-                }
+        for (qi, ii, id) in slot_ids(feature, param) {
+            match self.get(param, qi, ii, &id) {
+                Some(Ref::Body { feature }) => out.push(feature),
+                Some(_) => self.unresolved.push(format!("{id} (not a body)")),
+                None => {}
             }
         }
         out
     }
 
-    fn edges(&mut self, qs: &[(Option<String>, Vec<String>)]) -> Vec<EdgeSel> {
+    fn edges_of(&mut self, feature: &Json, param: &str) -> Vec<EdgeSel> {
+        // Per-feature edges from the blend-face resolution win.
+        if let Some(list) = self.table.edges.get(&self.feature) {
+            return list
+                .iter()
+                .map(|e| EdgeSel { a: e.a.clone(), b: e.b.clone(), side: e.side, hint: None, hint_box: e.hint_box })
+                .collect();
+        }
         let mut out = Vec::new();
-        for (_, ids) in qs {
-            for id in ids {
-                if let Some(Ref::Edge { a, b, side, hint }) = self.get(id) {
-                    out.push(EdgeSel { a, b, side, hint });
-                } else if self.table.get(id).is_some() {
-                    self.unresolved.push(format!("{id} (not an edge)"));
-                }
+        for (qi, ii, id) in slot_ids(feature, param) {
+            match self.get(param, qi, ii, &id) {
+                Some(Ref::Edge { a, b, side, hint }) => out.push(EdgeSel { a, b, side, hint, hint_box: None }),
+                Some(_) => self.unresolved.push(format!("{id} (not an edge)")),
+                None => {}
             }
         }
         out
@@ -274,26 +322,18 @@ fn bound(
     match kind {
         "BLIND" => Ok(Bound::Blind(param_length(feature, depth_id, scope)?)),
         "THROUGH_ALL" => Ok(Bound::ThroughAll),
-        "UP_TO_SURFACE" | "UP_TO_FACE" => {
-            let ids = query_ids(feature, face_id);
-            let id = ids.iter().flat_map(|(_, g)| g.iter()).next().ok_or("up-to-surface without a face")?;
-            match res.get(id) {
-                Some(Ref::Plane { origin, normal, .. }) => Ok(Bound::UpToPlane { origin, normal }),
-                Some(_) => Err(format!("up-to-surface target {id} is not a plane")),
-                None => Err(format!("unresolved {id}")),
+        "UP_TO_SURFACE" | "UP_TO_FACE" => match res.first(feature, face_id) {
+            Some(Ref::Plane { origin, normal, .. }) => Ok(Bound::UpToPlane { origin, normal }),
+            Some(_) => Err("up-to-surface target is not a plane".into()),
+            None => Err("unresolved up-to-surface target".into()),
+        },
+        "UP_TO_VERTEX" => match res.first(feature, vertex_id) {
+            Some(Ref::SketchPoint { sketch, id: pid }) => {
+                geom.point(&sketch, &pid).map(Bound::UpToPoint).ok_or_else(|| format!("sketch point {pid} of {sketch} not found"))
             }
-        }
-        "UP_TO_VERTEX" => {
-            let ids = query_ids(feature, vertex_id);
-            let id = ids.iter().flat_map(|(_, g)| g.iter()).next().ok_or("up-to-vertex without a vertex")?;
-            match res.get(id) {
-                Some(Ref::SketchPoint { sketch, id: pid }) => {
-                    geom.point(&sketch, &pid).map(Bound::UpToPoint).ok_or_else(|| format!("sketch point {pid} of {sketch} not found"))
-                }
-                Some(_) => Err(format!("up-to-vertex target {id} is not a sketch point")),
-                None => Err(format!("unresolved {id}")),
-            }
-        }
+            Some(_) => Err("up-to-vertex target is not a sketch point".into()),
+            None => Err("unresolved up-to-vertex target".into()),
+        },
         other => Err(format!("end bound {other}")),
     }
 }
@@ -311,7 +351,7 @@ pub fn plan_feature(
     let feature_id = m["featureId"].as_str().unwrap_or("").to_string();
     let name = m["name"].as_str().unwrap_or("").to_string();
     let feature_type = m["featureType"].as_str().unwrap_or("").to_string();
-    let mut res = Resolver { table, unresolved: Vec::new() };
+    let mut res = Resolver { table, feature: feature_id.clone(), unresolved: Vec::new() };
     let suppressed = match is_suppressed(feature, cfg, scope) {
         Ok(s) => s,
         Err(e) => {
@@ -325,7 +365,7 @@ pub fn plan_feature(
             "newSketch" | "cPlane" | "assignVariable" | "compositeCurve" | "measureDistance" => Ok(Step::Nothing),
             "extrude" => (|| {
                 let op = bool_op(&param_enum(feature, "operationType").unwrap_or_default())?;
-                let regions = res.regions(&query_ids(feature, "entities"));
+                let regions = res.regions_of(feature, "entities");
                 let flip = param_bool(feature, "oppositeDirection").unwrap_or(false);
                 let end = bound(feature, &param_enum(feature, "endBound").unwrap_or_default(), "depth", "endBoundEntityFace", "endBoundEntityVertex", scope, &mut res, geom)?;
                 let second = if param_bool(feature, "hasSecondDirection").unwrap_or(false) {
@@ -352,36 +392,42 @@ pub fn plan_feature(
                     return Err("extrude with draft".into());
                 }
                 let direction = if param_bool(feature, "hasExtrudeDirection").unwrap_or(false) {
-                    let ids = query_ids(feature, "extrudeDirection");
-                    let id = ids.iter().flat_map(|(_, g)| g.iter()).next().ok_or("extrude direction without a line")?;
-                    match res.get(id) {
+                    match res.first(feature, "extrudeDirection") {
                         Some(Ref::SketchLine { sketch, id: lid }) => {
                             let (a, b) = geom.line(&sketch, &lid).ok_or_else(|| format!("sketch line {lid} of {sketch} not found"))?;
                             Some(crate::unit3([b[0] - a[0], b[1] - a[1], b[2] - a[2]]))
                         }
-                        Some(_) => return Err(format!("extrude direction {id} is not a sketch line")),
-                        None => return Err(format!("unresolved {id}")),
+                        Some(_) => return Err("extrude direction is not a sketch line".into()),
+                        None => return Err("unresolved extrude direction".into()),
                     }
                 } else {
                     None
                 };
-                let targets = if param_bool(feature, "defaultScope").unwrap_or(true) { Vec::new() } else { res.bodies(&query_ids(feature, "booleanScope")) };
+                let targets = if param_bool(feature, "defaultScope").unwrap_or(true) { Vec::new() } else { res.bodies_of(feature, "booleanScope") };
                 Ok(Step::Extrude { regions, op, direction, flip, end, second, targets })
             })(),
             "loft" => (|| {
                 let op = bool_op(&param_enum(feature, "operationType").unwrap_or_default())?;
-                let mut profiles = Vec::new();
+                // Profiles are one array item each; slot query indices run
+                // over the whole array in order.
+                let mut profiles: Vec<Vec<RegionSel>> = Vec::new();
+                let mut q_offset = 0;
                 if let Some(items) = param(feature, "sheetProfilesArray").and_then(|p| p["items"].as_array()) {
                     for it in items {
                         let ps = it["message"]["parameters"].as_array().cloned().unwrap_or_default();
                         for p in ps {
                             if p["message"]["parameterId"] == "sheetProfileEntities" {
-                                profiles.extend(res.regions(&queries(&p["message"])));
+                                let qs = queries(&p["message"]);
+                                let regs = res.regions_in("sheetProfileEntities", &qs, q_offset);
+                                q_offset += qs.len();
+                                if !regs.is_empty() {
+                                    profiles.push(regs);
+                                }
                             }
                         }
                     }
                 }
-                let targets = if param_bool(feature, "defaultScope").unwrap_or(true) { Vec::new() } else { res.bodies(&query_ids(feature, "booleanScope")) };
+                let targets = if param_bool(feature, "defaultScope").unwrap_or(true) { Vec::new() } else { res.bodies_of(feature, "booleanScope") };
                 Ok(Step::Loft { profiles, op, targets })
             })(),
             "fillet" => (|| {
@@ -392,7 +438,7 @@ pub fn plan_feature(
                     return Err("variable or partial fillet".into());
                 }
                 let radius = param_length(feature, "radius", scope)?;
-                let edges = res.edges(&query_ids(feature, "entities"));
+                let edges = res.edges_of(feature, "entities");
                 Ok(Step::Fillet { edges, radius })
             })(),
             "chamfer" => (|| {
@@ -412,26 +458,24 @@ pub fn plan_feature(
                 };
                 let flip = param_bool(feature, "oppositeDirection").unwrap_or(false);
                 let (width_cap, width_wall) = if flip { (w2, w1) } else { (w1, w2) };
-                let edges = res.edges(&query_ids(feature, "entities"));
+                let edges = res.edges_of(feature, "entities");
                 Ok(Step::Chamfer { edges, width_cap, width_wall })
             })(),
             "booleanBodies" => (|| {
                 let op = bool_op(&param_enum(feature, "operationType").unwrap_or_default())?;
-                let tools = res.bodies(&query_ids(feature, "tools"));
-                let targets = res.bodies(&query_ids(feature, "targets"));
+                let tools = res.bodies_of(feature, "tools");
+                let targets = res.bodies_of(feature, "targets");
                 Ok(Step::Boolean { op, tools, targets })
             })(),
             "transform" => (|| {
-                let bodies = res.bodies(&query_ids(feature, "entities"));
+                let bodies = res.bodies_of(feature, "entities");
                 let body = bodies.first().cloned().ok_or("transform without a body")?;
                 match param_enum(feature, "transformType").unwrap_or_default().as_str() {
                     "ROTATION" => {
-                        let ids = query_ids(feature, "transformAxis");
-                        let id = ids.iter().flat_map(|(_, g)| g.iter()).next().ok_or("rotation without an axis")?;
-                        let (a, b) = match res.get(id) {
+                        let (a, b) = match res.first(feature, "transformAxis") {
                             Some(Ref::SketchLine { sketch, id: lid }) => geom.line(&sketch, &lid).ok_or_else(|| format!("sketch line {lid} of {sketch} not found"))?,
-                            Some(_) => return Err(format!("rotation axis {id} is not a sketch line")),
-                            None => return Err(format!("unresolved {id}")),
+                            Some(_) => return Err("rotation axis is not a sketch line".into()),
+                            None => return Err("unresolved rotation axis".into()),
                         };
                         let mut angle = param_angle(feature, "angle", scope)?;
                         if param_bool(feature, "oppositeDirection").unwrap_or(false) {
@@ -450,13 +494,47 @@ pub fn plan_feature(
         }
     };
     let unresolved = res.unresolved;
-    let step = if !unresolved.is_empty() && step.is_ok() { Err(format!("unresolved ids: {}", unresolved.join(", "))) } else { step };
+    // Region lists tolerate gaps (the resolved regions still cut); anything
+    // else unresolved fails the feature.
+    let partial_ok = matches!(&step, Ok(Step::Extrude { regions, .. }) if !regions.is_empty()) || matches!(&step, Ok(Step::Loft { profiles, .. }) if profiles.len() >= 2);
+    let step = if !unresolved.is_empty() && step.is_ok() && !partial_ok { Err(format!("unresolved ids: {}", unresolved.join(", "))) } else { step };
     Planned { index, feature_id, name, feature_type, suppressed, step, unresolved }
 }
 
 /// Plan every feature.
 pub fn plan_all(features: &[Json], cfg: &HashMap<String, Value>, scope: &dyn Scope, table: &IdTable, geom: &dyn GeomLookup) -> Vec<Planned> {
     features.iter().enumerate().map(|(i, f)| plan_feature(i, f, cfg, scope, table, geom)).collect()
+}
+
+/// Every query slot of a feature: `(parameter, query index, id index, query
+/// feature id, geometry id)`; array parameters count their queries in order.
+pub fn feature_slots(feature: &Json) -> Vec<(String, usize, usize, Option<String>, String)> {
+    let mut out = Vec::new();
+    fn walk(p: &Json, counts: &mut HashMap<String, usize>, out: &mut Vec<(String, usize, usize, Option<String>, String)>) {
+        let m = &p["message"];
+        let pid = m["parameterId"].as_str().unwrap_or("").to_string();
+        if p["typeName"] == "BTMParameterQueryList" {
+            let base = *counts.get(&pid).unwrap_or(&0);
+            let qs = queries(m);
+            for (qi, (fid, ids)) in qs.iter().enumerate() {
+                for (ii, id) in ids.iter().enumerate() {
+                    out.push((pid.clone(), base + qi, ii, fid.clone(), id.clone()));
+                }
+            }
+            counts.insert(pid, base + qs.len());
+        } else if p["typeName"] == "BTMParameterArray" {
+            for it in m["items"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                for pp in it["message"]["parameters"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                    walk(pp, counts, out);
+                }
+            }
+        }
+    }
+    let mut counts = HashMap::new();
+    for p in feature["message"]["parameters"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        walk(p, &mut counts, &mut out);
+    }
+    out
 }
 
 /// Every deterministic id a feature's queries mention, with the parameter

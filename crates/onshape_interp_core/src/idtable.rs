@@ -20,12 +20,21 @@
 //!
 //! Entries may also carry `"note"` (free text) and `"source"` (how the
 //! entry was obtained: `"derived"`, `"api"`, `"manual"`).
+//!
+//! Deterministic ids are not stable across configurations in this model
+//! (a block shift moves every later id when a feature's output count
+//! changes), so references are also stored per **query slot**
+//! (`"<feature id>/<parameter id>/<query index>/<id index>"`) under
+//! `"slots"`, and a fillet's or chamfer's edges per feature under
+//! `"edges"` as the face pairs its blend faces join. Lookups try the slot,
+//! then the id. The top-level JSON is `{"ids": {...}, "slots": {...},
+//! "edges": {...}}`; a bare id map is accepted for older files.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FaceRole {
     /// The face at the far end of an extrude (or the flat top / bottom a
@@ -63,6 +72,10 @@ pub enum Ref {
         origin: [f64; 3],
         normal: [f64; 3],
         x: [f64; 3],
+        /// A datum plane (standard or cPlane) rather than a body face; a
+        /// sketch on a body face is split by the face's edges.
+        #[serde(default)]
+        datum: bool,
     },
     Body {
         feature: String,
@@ -106,25 +119,74 @@ pub struct Entry {
     pub source: Option<String>,
 }
 
+/// One edge of a fillet / chamfer as the pair of faces its blend joins,
+/// with the blend face's bounding box (model frame, metres) at the
+/// configuration it was resolved at.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EdgeRef {
+    pub a: FaceRef,
+    pub b: FaceRef,
+    pub side: SideRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_box: Option<[f64; 6]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(transparent)]
 pub struct IdTable {
+    #[serde(default, rename = "ids")]
     pub entries: HashMap<String, Entry>,
+    #[serde(default)]
+    pub slots: HashMap<String, Entry>,
+    #[serde(default)]
+    pub edges: HashMap<String, Vec<EdgeRef>>,
+}
+
+fn sorted_map<T: Serialize>(m: &HashMap<String, T>) -> serde_json::Value {
+    let mut keys: Vec<&String> = m.keys().collect();
+    keys.sort();
+    let mut map = serde_json::Map::new();
+    for k in keys {
+        map.insert(k.clone(), serde_json::to_value(&m[k]).unwrap());
+    }
+    serde_json::Value::Object(map)
 }
 
 impl IdTable {
     pub fn from_json(text: &str) -> Result<IdTable, String> {
-        serde_json::from_str(text).map_err(|e| e.to_string())
+        let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        if v.get("ids").is_some() || v.get("slots").is_some() || v.get("edges").is_some() {
+            serde_json::from_value(v).map_err(|e| e.to_string())
+        } else {
+            let entries: HashMap<String, Entry> = serde_json::from_value(v).map_err(|e| e.to_string())?;
+            Ok(IdTable { entries, ..Default::default() })
+        }
     }
 
     pub fn to_json(&self) -> String {
-        let mut keys: Vec<&String> = self.entries.keys().collect();
-        keys.sort();
         let mut map = serde_json::Map::new();
-        for k in keys {
-            map.insert(k.clone(), serde_json::to_value(&self.entries[k]).unwrap());
-        }
+        map.insert("ids".into(), sorted_map(&self.entries));
+        map.insert("slots".into(), sorted_map(&self.slots));
+        map.insert("edges".into(), sorted_map(&self.edges));
         serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
+    }
+
+    /// The slot key for the `ii`-th id of the `qi`-th query of a parameter.
+    pub fn slot_key(feature: &str, param: &str, qi: usize, ii: usize) -> String {
+        format!("{feature}/{param}/{qi}/{ii}")
+    }
+
+    pub fn insert_slot(&mut self, key: &str, r: Ref, source: &str) {
+        self.slots.insert(key.to_string(), Entry { r, note: None, source: Some(source.to_string()) });
+    }
+
+    /// Slot entry first, then the id.
+    pub fn lookup(&self, slot: &str, id: &str) -> Option<&Ref> {
+        match self.slots.get(slot).map(|e| &e.r) {
+            Some(Ref::Unresolved { .. }) | None => self.get(id),
+            some => some,
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<&Ref> {
@@ -152,7 +214,7 @@ mod tests {
     #[test]
     fn json_round_trip() {
         let mut t = IdTable::default();
-        t.insert("JDC", Ref::Plane { origin: [0.0; 3], normal: [0.0, 0.0, 1.0], x: [1.0, 0.0, 0.0] }, "derived");
+        t.insert("JDC", Ref::Plane { origin: [0.0; 3], normal: [0.0, 0.0, 1.0], x: [1.0, 0.0, 0.0], datum: true }, "derived");
         t.insert(
             "RFB9",
             Ref::Edge {

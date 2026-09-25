@@ -664,3 +664,54 @@ mod tests {
 
 
 
+
+#[cfg(test)]
+mod corner_tests {
+    use super::*;
+
+    fn rect(prefix: &str, x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<Piece> {
+        let l = |id: String, a: P2, b: P2| Piece { id, curve: Curve::Line { a, b } };
+        vec![
+            l(format!("{prefix}.b"), [x0, y0], [x1, y0]),
+            l(format!("{prefix}.r"), [x1, y0], [x1, y1]),
+            l(format!("{prefix}.t"), [x1, y1], [x0, y1]),
+            l(format!("{prefix}.l"), [x0, y1], [x0, y0]),
+        ]
+    }
+
+    #[test]
+    fn corner_fillet_after_hole_differences() {
+        let mut base = arrange(&rect("B", 0.0, 0.0, 0.6858, 0.6858), 1e-7);
+        for k in 0..16 {
+            let x = 0.05 + 0.03 * k as f64;
+            let hole = arrange(&rect(&format!("H{k}"), x, 0.2, x + 0.005, 0.25), 1e-7);
+            base = difference(&base, &hole, 1e-7);
+        }
+        assert_eq!(base.len(), 1);
+        let area0 = base[0].area;
+        assert!((area0 - (0.6858 * 0.6858 - 16.0 * 0.005 * 0.05)).abs() < 1e-9);
+        // Round every outer corner with r = 12.7 mm.
+        let reg = &mut base[0];
+        let mut k = 0;
+        let mut rounded = 0;
+        while k < reg.outer.len() && rounded < 8 {
+            if fillet_corner(&mut reg.outer, k, 0.0127, "f") {
+                rounded += 1;
+                k += 2;
+            } else {
+                k += 1;
+            }
+        }
+        assert_eq!(rounded, 4);
+        // Re-arrange to recompute the area: four corners lose (1 - pi/4) r^2 each.
+        let pieces: Vec<Piece> = reg.pieces().cloned().collect();
+        let again = arrange(&pieces, 1e-7);
+        let outer = again.iter().max_by(|a, b| a.area.partial_cmp(&b.area).unwrap()).unwrap();
+        let expect = area0 - 4.0 * (1.0 - std::f64::consts::FRAC_PI_4) * 0.0127 * 0.0127;
+        assert!((outer.area - expect).abs() < 1e-9, "{} vs {expect}", outer.area);
+        assert!(outer.contains([0.3, 0.1]));
+        assert!(outer.contains([0.0005, 0.3]));
+        assert!(!outer.contains([0.001, 0.001]));
+        assert_eq!(outer.holes.len(), 16);
+    }
+}
