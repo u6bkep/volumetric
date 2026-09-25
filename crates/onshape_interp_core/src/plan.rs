@@ -61,6 +61,8 @@ pub enum Step {
     Loft {
         /// One entry per profile; a profile is the union of its regions.
         profiles: Vec<Vec<RegionSel>>,
+        /// Guides as chains of sketch curves `(sketch feature, entity id)`.
+        guides: Vec<Vec<(String, String)>>,
         op: BoolOp,
         targets: Vec<String>,
     },
@@ -442,7 +444,43 @@ pub fn plan_feature(
                     }
                 }
                 let targets = if param_bool(feature, "defaultScope").unwrap_or(true) { Vec::new() } else { res.bodies_of(feature, "booleanScope") };
-                Ok(Step::Loft { profiles, op, targets })
+                // Guides: sketch curves directly, or a composite curve's edges.
+                let mut guides: Vec<Vec<(String, String)>> = Vec::new();
+                let mut gq = 0usize;
+                if let Some(items) = param(feature, "guidesArray").and_then(|p| p["items"].as_array()) {
+                    for it in items {
+                        let ps = it["message"]["parameters"].as_array().cloned().unwrap_or_default();
+                        for p in ps {
+                            if p["message"]["parameterId"] == "guideEntities" {
+                                let qs = queries(&p["message"]);
+                                for (qi, (_, ids)) in qs.iter().enumerate() {
+                                    for (ii, id) in ids.iter().enumerate() {
+                                        let key = IdTable::slot_key(&feature_id, "guideEntities", gq + qi, ii);
+                                        match table.lookup(&key, id) {
+                                            Some(Ref::SketchLine { sketch, id }) => guides.push(vec![(sketch.clone(), id.clone())]),
+                                            Some(Ref::Guide { composite }) => {
+                                                let mut chain = Vec::new();
+                                                for (k, e) in table.slots.iter() {
+                                                    if k.starts_with(&format!("{composite}/edges/")) {
+                                                        if let Ref::SketchLine { sketch, id } = &e.r {
+                                                            chain.push((sketch.clone(), id.clone()));
+                                                        }
+                                                    }
+                                                }
+                                                if !chain.is_empty() {
+                                                    guides.push(chain);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                gq += qs.len();
+                            }
+                        }
+                    }
+                }
+                Ok(Step::Loft { profiles, guides, op, targets })
             })(),
             "fillet" => (|| {
                 if param_enum(feature, "filletType").as_deref() != Some("EDGE") {

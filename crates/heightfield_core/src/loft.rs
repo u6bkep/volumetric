@@ -54,7 +54,7 @@ impl Profile {
     }
 
     /// Cumulative arc length at each point (and the total at the end).
-    fn cumulative(&self) -> Vec<f64> {
+    pub fn cumulative(&self) -> Vec<f64> {
         let n = self.points.len();
         let mut s = Vec::with_capacity(n + 1);
         let mut acc = 0.0;
@@ -66,8 +66,28 @@ impl Profile {
         s
     }
 
+    /// Arc-length position of the point on the loop nearest `p`, and the
+    /// distance to it.
+    pub fn nearest(&self, cum: &[f64], p: P3) -> (f64, f64) {
+        let n = self.points.len();
+        let mut best = (0.0, f64::INFINITY);
+        for i in 0..n {
+            let a = self.points[i];
+            let b = self.points[(i + 1) % n];
+            let d = sub3(b, a);
+            let l2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            let t = if l2 > 0.0 { (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1] + (p[2] - a[2]) * d[2]) / l2).clamp(0.0, 1.0) } else { 0.0 };
+            let q = lerp3(a, b, t);
+            let dist = norm3(sub3(p, q));
+            if dist < best.1 {
+                best = (cum[i] + t * (cum[i + 1] - cum[i]), dist);
+            }
+        }
+        best
+    }
+
     /// Point at arc length `s` (wrapping).
-    fn at(&self, cum: &[f64], s: f64) -> P3 {
+    pub fn at(&self, cum: &[f64], s: f64) -> P3 {
         let total = *cum.last().unwrap();
         let s = s.rem_euclid(total.max(1e-300));
         let n = self.points.len();
@@ -164,6 +184,67 @@ pub fn match_profiles(a: &Profile, b: &Profile, samples_per_span: usize) -> (Vec
         }
     }
     (pa, pb)
+}
+
+/// Evaluate an open polyline at fraction `f` of its length.
+pub fn polyline_at(pts: &[P3], f: f64) -> P3 {
+    if pts.len() < 2 {
+        return pts.first().copied().unwrap_or([0.0; 3]);
+    }
+    let mut cum = vec![0.0];
+    for w in pts.windows(2) {
+        cum.push(cum.last().unwrap() + norm3(sub3(w[1], w[0])));
+    }
+    let total = *cum.last().unwrap();
+    let s = (f.clamp(0.0, 1.0) * total).min(total);
+    let i = match cum.binary_search_by(|v| v.partial_cmp(&s).unwrap()) {
+        Ok(i) => i.min(pts.len() - 2),
+        Err(i) => i.saturating_sub(1).min(pts.len() - 2),
+    };
+    let seg = cum[i + 1] - cum[i];
+    let t = if seg > 0.0 { (s - cum[i]) / seg } else { 0.0 };
+    lerp3(pts[i], pts[i + 1], t)
+}
+
+/// A bilinearly blended (Coons) patch between two profile arcs and two
+/// guide curves: `a(u)` runs along the first profile, `b(u)` along the
+/// second, `g0(v)` from `a(0)` to `b(0)` and `g1(v)` from `a(1)` to `b(1)`.
+/// The guides are shifted linearly so their ends meet the profiles.
+pub fn coons_triangles(a: &dyn Fn(f64) -> P3, b: &dyn Fn(f64) -> P3, g0: &[P3], g1: &[P3], nu: usize, nv: usize) -> Vec<[P3; 3]> {
+    let (a0, a1, b0, b1) = (a(0.0), a(1.0), b(0.0), b(1.0));
+    let corrected = |g: &[P3], pa: P3, pb: P3, v: f64| -> P3 {
+        let raw = polyline_at(g, v);
+        let (s, e) = (g[0], g[g.len() - 1]);
+        let ds = sub3(pa, s);
+        let de = sub3(pb, e);
+        [raw[0] + (1.0 - v) * ds[0] + v * de[0], raw[1] + (1.0 - v) * ds[1] + v * de[1], raw[2] + (1.0 - v) * ds[2] + v * de[2]]
+    };
+    let mut grid: Vec<P3> = Vec::with_capacity((nu + 1) * (nv + 1));
+    for j in 0..=nv {
+        let v = j as f64 / nv as f64;
+        let ga = corrected(g0, a0, b0, v);
+        let gb = corrected(g1, a1, b1, v);
+        for i in 0..=nu {
+            let u = i as f64 / nu as f64;
+            let pa = a(u);
+            let pb = b(u);
+            let mut p = [0.0; 3];
+            for k in 0..3 {
+                p[k] = (1.0 - v) * pa[k] + v * pb[k] + (1.0 - u) * ga[k] + u * gb[k]
+                    - ((1.0 - u) * (1.0 - v) * a0[k] + u * (1.0 - v) * a1[k] + (1.0 - u) * v * b0[k] + u * v * b1[k]);
+            }
+            grid.push(p);
+        }
+    }
+    let mut tris = Vec::with_capacity(2 * nu * nv);
+    let idx = |i: usize, j: usize| j * (nu + 1) + i;
+    for j in 0..nv {
+        for i in 0..nu {
+            tris.push([grid[idx(i, j)], grid[idx(i + 1, j)], grid[idx(i, j + 1)]]);
+            tris.push([grid[idx(i + 1, j)], grid[idx(i + 1, j + 1)], grid[idx(i, j + 1)]]);
+        }
+    }
+    tris
 }
 
 /// Ruled surface between two equal-length closed point lists.

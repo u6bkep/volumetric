@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use heightfield_core::kernel::{BlendOptions, Kernel, blend};
-use heightfield_core::loft::{Profile, match_profiles, ruled_triangles};
+use heightfield_core::loft::{Profile, coons_triangles, match_profiles, ruled_triangles};
 use heightfield_core::raster::{P3, include_cap_labelled, include_triangles_labelled, triangulate_loop};
 use heightfield_core::{Body, FaceSel, Grid, Op, Prism, Side, Solid};
 use onshape_import_core::sketch3d::Frame;
@@ -355,7 +355,60 @@ impl Exec {
         Ok((sk, merged))
     }
 
-    fn run_loft(&mut self, p: &Planned, profiles: &[Vec<RegionSel>], op: BoolOp, targets: &[String]) -> Result<String, String> {
+    /// A guide as a 3D polyline: its curves chained end to end.
+    fn guide_polyline(&self, curves: &[(String, String)]) -> Result<Vec<P3>, String> {
+        let mut pieces: Vec<Vec<P3>> = Vec::new();
+        for (sid, id) in curves {
+            let sk = self.sketches.get(sid).ok_or_else(|| format!("guide sketch {sid} not solved"))?;
+            let piece = sk.pieces.iter().chain(sk.construction.iter()).find(|p| &p.id == id).ok_or_else(|| format!("guide curve {id} not in sketch {}", sk.name))?;
+            let n = match piece.curve {
+                Curve::Line { .. } => 1,
+                Curve::Arc { r, sweep, .. } => {
+                    let per = 2.0 * (1.0 - self.chord_tol / r).max(-1.0).acos();
+                    ((sweep.abs() / per.max(1e-6)).ceil() as usize).clamp(1, 512)
+                }
+            };
+            pieces.push((0..=n).map(|q| sk.frame.to_3d(piece.curve.point(q as f64 / n as f64))).collect());
+        }
+        let mut chain = pieces.remove(0);
+        while !pieces.is_empty() {
+            let end = *chain.last().unwrap();
+            let start = chain[0];
+            let d = |a: P3, b: P3| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+            let mut best: Option<(usize, bool, bool, f64)> = None; // (index, reverse, prepend, dist)
+            for (k, pc) in pieces.iter().enumerate() {
+                let cands = [
+                    (false, false, d(end, pc[0])),
+                    (true, false, d(end, *pc.last().unwrap())),
+                    (false, true, d(start, *pc.last().unwrap())),
+                    (true, true, d(start, pc[0])),
+                ];
+                for (rev, pre, dist) in cands {
+                    if best.is_none_or(|b| dist < b.3) {
+                        best = Some((k, rev, pre, dist));
+                    }
+                }
+            }
+            let (k, rev, pre, dist) = best.unwrap();
+            if dist > 1e-3 {
+                return Err(format!("guide curves do not chain (gap {:.2} mm)", dist * 1e3));
+            }
+            let mut pc = pieces.remove(k);
+            if rev {
+                pc.reverse();
+            }
+            if pre {
+                pc.pop();
+                pc.extend(chain);
+                chain = pc;
+            } else {
+                chain.extend(pc.into_iter().skip(1));
+            }
+        }
+        Ok(chain)
+    }
+
+    fn run_loft(&mut self, p: &Planned, profiles: &[Vec<RegionSel>], guides: &[Vec<(String, String)>], op: BoolOp, targets: &[String]) -> Result<String, String> {
         if profiles.len() != 2 {
             return Err(format!("loft with {} profiles", profiles.len()));
         }
@@ -364,9 +417,84 @@ impl Exec {
         let (ra, rb) = (&ra, &rb);
         let pa = self.profile_of(sa, ra);
         let pb = self.profile_of(sb, rb);
-        let (qa, qb) = match_profiles(&pa, &pb, 48);
         let label = p.index as u32 * 16;
-        let side_tris = ruled_triangles(&qa, &qb);
+        let mut guide_note = String::new();
+        let mut side_tris: Vec<[P3; 3]> = Vec::new();
+        // Guides that reach both profiles define Coons panels between them.
+        let mut attached: Vec<(f64, f64, Vec<P3>)> = Vec::new(); // (s on A, s on B, polyline from A to B)
+        let ca = pa.cumulative();
+        let cb = pb.cumulative();
+        let (la, lb) = (*ca.last().unwrap(), *cb.last().unwrap());
+        let mut skipped = 0;
+        for g in guides {
+            match self.guide_polyline(g) {
+                Ok(mut poly) => {
+                    let (s0a, d0a) = pa.nearest(&ca, poly[0]);
+                    let (s0b, d0b) = pb.nearest(&cb, poly[0]);
+                    let (s1a, d1a) = pa.nearest(&ca, *poly.last().unwrap());
+                    let (s1b, d1b) = pb.nearest(&cb, *poly.last().unwrap());
+                    // Orient from A to B.
+                    let (sa_, sb_, da, db) = if d0a + d1b <= d1a + d0b {
+                        (s0a, s1b, d0a, d1b)
+                    } else {
+                        poly.reverse();
+                        (s1a, s0b, d1a, d0b)
+                    };
+                    if da > 5e-3 || db > 5e-3 {
+                        skipped += 1;
+                        continue;
+                    }
+                    attached.push((sa_, sb_, poly));
+                }
+                Err(e) => {
+                    guide_note.push_str(&format!("; guide: {e}"));
+                    skipped += 1;
+                }
+            }
+        }
+        if !attached.is_empty() {
+            attached.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+            // B runs the same way as A when its attachment parameters
+            // increase along with A's; else flip B's parametrisation.
+            let n = attached.len();
+            let mut inc = 0i32;
+            for i in 0..n {
+                let (b0, b1) = (attached[i].1, attached[(i + 1) % n].1);
+                let fwd = (b1 - b0).rem_euclid(lb);
+                inc += if fwd < lb / 2.0 { 1 } else { -1 };
+            }
+            let flip_b = n >= 2 && inc < 0;
+            let b_at = |s: f64| -> P3 { if flip_b { pb.at(&cb, lb - s) } else { pb.at(&cb, s) } };
+            let sb_of = |s: f64| if flip_b { (lb - s).rem_euclid(lb) } else { s };
+            for i in 0..n {
+                let (s0a, s0b_raw, ref g0) = attached[i];
+                let (s1a, s1b_raw, ref g1) = attached[(i + 1) % n];
+                let s0b = sb_of(s0b_raw);
+                let s1b = sb_of(s1b_raw);
+                let mut da_ = s1a - s0a;
+                if n == 1 || da_ <= 1e-9 {
+                    da_ += la;
+                }
+                let mut db_ = s1b - s0b;
+                if n == 1 || db_ <= 1e-9 {
+                    db_ += lb;
+                }
+                let a = |u: f64| pa.at(&ca, s0a + u * da_);
+                let b = |u: f64| b_at(s0b + u * db_);
+                let glen = |g: &[P3]| g.windows(2).map(|w| ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2) + (w[1][2] - w[0][2]).powi(2)).sqrt()).sum::<f64>();
+                let nu = ((da_.max(db_) / 2e-3).ceil() as usize).clamp(4, 96);
+                let nv = ((glen(g0).max(glen(g1)) / 2e-3).ceil() as usize).clamp(4, 96);
+                side_tris.extend(coons_triangles(&a, &b, g0, g1, nu, nv));
+            }
+            guide_note.push_str(&format!("; {} guides -> {} Coons panels{}", n, n, if flip_b { " (B reversed)" } else { "" }));
+        }
+        if skipped > 0 {
+            guide_note.push_str(&format!("; {skipped} guides skipped"));
+        }
+        if side_tris.is_empty() {
+            let (qa, qb) = match_profiles(&pa, &pb, 48);
+            side_tris = ruled_triangles(&qa, &qb);
+        }
         let mut body = Body::empty(&self.grid);
         let mut cap_tris = Vec::new();
         for (sk, r) in [(sa, ra), (sb, rb)] {
@@ -395,7 +523,7 @@ impl Exec {
             BoolOp::Add | BoolOp::Remove => {
                 let targets = self.targets_of(targets)?;
                 let hf_op = if op == BoolOp::Add { Op::Add } else { Op::Remove };
-                Ok(self.apply_to_targets(&targets, &body, hf_op, label))
+                Ok(format!("{}{}", self.apply_to_targets(&targets, &body, hf_op, label), guide_note))
             }
             BoolOp::Intersect => Err("intersect loft".into()),
         }
@@ -579,7 +707,7 @@ impl Exec {
                             Err(e) => Status::Failed(e),
                         }
                     }
-                    Ok(Step::Loft { profiles, op, targets }) => match self.run_loft(p, profiles, *op, targets) {
+                    Ok(Step::Loft { profiles, guides, op, targets }) => match self.run_loft(p, profiles, guides, *op, targets) {
                         Ok(s) => Status::Applied(s),
                         Err(e) => Status::Failed(e),
                     },

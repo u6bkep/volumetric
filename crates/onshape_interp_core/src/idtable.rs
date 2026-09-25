@@ -113,6 +113,11 @@ pub enum Ref {
     RegionList {
         regions: Vec<RegionEntry>,
     },
+    /// A loft guide made by a compositeCurve feature (its `edges` slots are
+    /// the sketch curves to chain).
+    Guide {
+        composite: String,
+    },
     SketchPoint {
         sketch: String,
         id: String,
