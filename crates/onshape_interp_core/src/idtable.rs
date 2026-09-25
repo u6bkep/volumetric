@@ -113,6 +113,25 @@ pub enum Ref {
     RegionList {
         regions: Vec<RegionEntry>,
     },
+    /// A vertical wall face an extrude made along one boundary entity of its
+    /// region, used as a loft profile; `t0..t1` is the fraction of that
+    /// entity the face covered at the configuration it was resolved at.
+    WallFace {
+        extrude: String,
+        sketch: String,
+        ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pick: Option<usize>,
+        entity: String,
+        t0: f64,
+        t1: f64,
+    },
+    /// Per sketch (key `<feature>/sketch`): whether the seed fit's frame is
+    /// mirrored relative to Onshape's sketch normal, decided against the API
+    /// resolutions (which way the arcs turn).
+    SketchFrame {
+        flipped: bool,
+    },
     /// A loft guide made by a compositeCurve feature (its `edges` slots are
     /// the sketch curves to chain).
     Guide {

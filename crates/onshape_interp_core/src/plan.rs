@@ -32,6 +32,9 @@ pub struct RegionSel {
     pub sketch: String,
     pub ids: Vec<String>,
     pub pick: Option<usize>,
+    /// A wall face of an extrude along this region's boundary entity
+    /// (`extrude feature, entity id, t0, t1`) instead of the region itself.
+    pub wall: Option<(String, String, f64, f64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -237,7 +240,7 @@ impl Resolver<'_> {
 
     fn list(&self, param: &str, item: Option<usize>) -> Option<Vec<RegionSel>> {
         match self.table.slots.get(&IdTable::list_key(&self.feature, param, item)).map(|e| &e.r) {
-            Some(Ref::RegionList { regions }) => Some(regions.iter().map(|r: &RegionEntry| RegionSel { sketch: r.sketch.clone(), ids: r.ids.clone(), pick: r.pick }).collect()),
+            Some(Ref::RegionList { regions }) => Some(regions.iter().map(|r: &RegionEntry| RegionSel { sketch: r.sketch.clone(), ids: r.ids.clone(), pick: r.pick, wall: None }).collect()),
             _ => None,
         }
     }
@@ -249,7 +252,7 @@ impl Resolver<'_> {
         let mut out = Vec::new();
         for (qi, ii, id) in slot_ids(feature, param) {
             match self.get(param, qi, ii, &id) {
-                Some(Ref::Region { sketch, ids, pick }) => out.push(RegionSel { sketch, ids, pick }),
+                Some(Ref::Region { sketch, ids, pick }) => out.push(RegionSel { sketch, ids, pick, wall: None }),
                 Some(_) => self.unresolved.push(format!("{id} (not a region)")),
                 None => {}
             }
@@ -262,7 +265,8 @@ impl Resolver<'_> {
         for (qi, (_, ids)) in qs.iter().enumerate() {
             for (ii, id) in ids.iter().enumerate() {
                 match self.get(param, qi + q_offset, ii, id) {
-                    Some(Ref::Region { sketch, ids, pick }) => out.push(RegionSel { sketch, ids, pick }),
+                    Some(Ref::Region { sketch, ids, pick }) => out.push(RegionSel { sketch, ids, pick, wall: None }),
+                    Some(Ref::WallFace { extrude, sketch, ids, pick, entity, t0, t1 }) => out.push(RegionSel { sketch, ids, pick, wall: Some((extrude, entity, t0, t1)) }),
                     Some(_) => self.unresolved.push(format!("{id} (not a region)")),
                     None => {}
                 }

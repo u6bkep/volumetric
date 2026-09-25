@@ -301,9 +301,29 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
     // curving right).
     let angle_tol = 1e-5f64.max(100.0 * eps);
     for list in out.iter_mut() {
+        // Measure angles from the middle of the largest empty gap around the
+        // vertex, so no tangent pair straddles the wrap of atan2.
+        let mut angles: Vec<f64> = list.iter().map(|&h| angle_key(&hes[h]).0).collect();
+        angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut base = 0.0;
+        if angles.len() >= 2 {
+            let mut best_gap = -1.0;
+            for i in 0..angles.len() {
+                let a = angles[i];
+                let b = if i + 1 < angles.len() { angles[i + 1] } else { angles[0] + std::f64::consts::TAU };
+                if b - a > best_gap {
+                    best_gap = b - a;
+                    base = 0.5 * (a + b);
+                }
+            }
+        }
+        let key = |h: usize| -> (f64, f64) {
+            let (ang, curv) = angle_key(&hes[h]);
+            ((ang - base).rem_euclid(std::f64::consts::TAU), curv)
+        };
         list.sort_by(|&a, &b| {
-            let ka = angle_key(&hes[a]);
-            let kb = angle_key(&hes[b]);
+            let ka = key(a);
+            let kb = key(b);
             let d = ka.0 - kb.0;
             if d.abs() > angle_tol {
                 d.partial_cmp(&0.0).unwrap()
@@ -715,3 +735,6 @@ mod corner_tests {
         assert_eq!(outer.holes.len(), 16);
     }
 }
+
+
+

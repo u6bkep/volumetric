@@ -237,11 +237,11 @@ pub fn blend(
             let (ex, ey) = (bx - ax, by - ay);
             let l2 = ex * ex + ey * ey;
             let inside = if l2 < 0.25 {
-                (px - ax).powi(2) + (py - ay).powi(2) <= 1.0
+                (px - ax).powi(2) + (py - ay).powi(2) <= 2.0
             } else {
                 let t = ((px - ax) * ex + (py - ay) * ey) / l2;
                 let perp = ((px - ax) * ey - (py - ay) * ex).abs() / l2.sqrt();
-                (-0.1..=1.1).contains(&t) && perp <= 1.0
+                (-0.2..=1.2).contains(&t) && perp <= 1.6
             };
             if !inside {
                 continue;
@@ -255,7 +255,63 @@ pub fn blend(
         acc
     };
     let band_cells: Vec<usize> = (0..g.len()).filter(|&k| d2[k].sqrt() <= write_r && !h[k].is_nan()).collect();
-    let band_vals: Vec<f32> = map_par(&band_cells, |&k| second(k));
+    let mut band_vals: Vec<f32> = map_par(&band_cells, |&k| second(k));
+    // Spans of neighbouring balls can leave single cells uncovered along a
+    // curved edge; a cell with covered cells on both sides takes their mean.
+    {
+        let mut val_at = vec![f32::NAN; g.len()];
+        for (&k, &v) in band_cells.iter().zip(band_vals.iter()) {
+            if v.is_finite() {
+                val_at[k] = v;
+            }
+        }
+        // Along each of four directions, look up to `reach` cells each way
+        // for covered cells and interpolate between the nearest pair.
+        let reach: isize = 4;
+        let fills: Vec<f32> = map_par(&(0..band_cells.len()).collect::<Vec<_>>(), |&idx| {
+            let k = band_cells[idx];
+            if band_vals[idx].is_finite() {
+                return band_vals[idx];
+            }
+            let (i, j) = g.ij(k);
+            let (i, j) = (i as isize, j as isize);
+            let get = |ii: isize, jj: isize| -> f32 {
+                if ii < 0 || jj < 0 || ii >= nx as isize || jj >= ny as isize {
+                    f32::NAN
+                } else {
+                    val_at[g.idx(ii as usize, jj as usize)]
+                }
+            };
+            let mut best: Option<(isize, f32)> = None; // (total span, value)
+            for (di, dj) in [(1isize, 0isize), (0, 1), (1, 1), (1, -1)] {
+                let mut a: Option<(isize, f32)> = None;
+                let mut b: Option<(isize, f32)> = None;
+                for s in 1..=reach {
+                    if a.is_none() {
+                        let v = get(i - s * di, j - s * dj);
+                        if v.is_finite() {
+                            a = Some((s, v));
+                        }
+                    }
+                    if b.is_none() {
+                        let v = get(i + s * di, j + s * dj);
+                        if v.is_finite() {
+                            b = Some((s, v));
+                        }
+                    }
+                }
+                if let (Some((sa, va)), Some((sb, vb))) = (a, b) {
+                    let span = sa + sb;
+                    if best.is_none_or(|(bs, _)| span < bs) {
+                        let t = sa as f32 / span as f32;
+                        best = Some((span, va + t * (vb - va)));
+                    }
+                }
+            }
+            best.map(|(_, v)| v).unwrap_or(f32::NAN)
+        });
+        band_vals = fills;
+    }
 
     for (&k, &v) in band_cells.iter().zip(band_vals.iter()) {
         if !v.is_finite() {

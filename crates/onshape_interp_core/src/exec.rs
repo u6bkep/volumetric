@@ -56,6 +56,8 @@ pub struct Exec {
     /// Columns emptied / changed by the last apply (footprint bookkeeping).
     pub last_emptied: usize,
     pub last_changed: usize,
+    /// z range of each extrude's prism (by feature id), for wall faces.
+    pub extrude_z: HashMap<String, (f64, f64)>,
 }
 
 fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -122,6 +124,7 @@ impl Exec {
             chord_tol: 2e-5,
             last_emptied: 0,
             last_changed: 0,
+            extrude_z: HashMap::new(),
         }
     }
 
@@ -219,6 +222,7 @@ impl Exec {
         let mut sweep_desc = String::new();
         let mut missing = Vec::new();
         let mut region_areas: Vec<String> = Vec::new();
+        let mut z_range = (f64::INFINITY, f64::NEG_INFINITY);
         for sel in regions {
             let (sk, region) = match self.region_of(sel) {
                 Ok(x) => x,
@@ -239,6 +243,8 @@ impl Exec {
             for k in 0..self.grid.len() {
                 if !pb.lo[k].is_nan() {
                     body.include_span(k, pb.lo[k], pb.hi[k]);
+                    z_range.0 = z_range.0.min(pb.lo[k] as f64);
+                    z_range.1 = z_range.1.max(pb.hi[k] as f64);
                 }
             }
             if sk.normal[2].abs() > 1.0 - 1e-9 && dir[2].abs() > 1.0 - 1e-9 {
@@ -250,6 +256,7 @@ impl Exec {
         if missing.len() == regions.len() {
             return Err(missing.join("; "));
         }
+        self.extrude_z.insert(p.feature_id.clone(), z_range);
         let missing_note = if missing.is_empty() { String::new() } else { format!("; MISSING {} of {} regions: {}", missing.len(), regions.len(), missing.join("; ")) };
         match op {
             BoolOp::New => {
@@ -321,25 +328,76 @@ impl Exec {
         triangulate_loop(&pts2).into_iter().map(|[a, b, c]| [prof.points[a], prof.points[b], prof.points[c]]).collect()
     }
 
+    /// A wall-face profile: the boundary entity of an extrude's region between
+    /// fractions `t0..t1`, at the prism's bottom and top heights.
+    fn wall_profile(&self, sel: &RegionSel) -> Result<(String, Profile, String), String> {
+        let (extrude, entity, t0, t1) = sel.wall.clone().unwrap();
+        let (sk, region) = self.region_of(sel)?;
+        let (zlo, zhi) = self.extrude_z.get(&extrude).copied().ok_or_else(|| format!("wall face: extrude {extrude} not run yet"))?;
+        let pieces: Vec<&Piece> = region.pieces().filter(|p| p.id == entity).collect();
+        if pieces.is_empty() {
+            return Err(format!("wall face: entity {entity} is not on the region boundary"));
+        }
+        // Order the pieces along the entity and sample them.
+        let mut pts2: Vec<[f64; 2]> = Vec::new();
+        for p in &pieces {
+            let n = match p.curve {
+                Curve::Line { .. } => 4,
+                Curve::Arc { .. } => 24,
+            };
+            for q in 0..=n {
+                let x = p.curve.point(q as f64 / n as f64);
+                if pts2.last().is_none_or(|l| (l[0] - x[0]).abs() + (l[1] - x[1]).abs() > 1e-9) {
+                    pts2.push(x);
+                }
+            }
+        }
+        // Keep the fraction range (by arc length).
+        let mut cum = vec![0.0];
+        for w in pts2.windows(2) {
+            cum.push(cum.last().unwrap() + ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2)).sqrt());
+        }
+        let total = *cum.last().unwrap();
+        let at = |f: f64| -> [f64; 2] {
+            let s = f.clamp(0.0, 1.0) * total;
+            let i = cum.iter().position(|&c| c >= s).unwrap_or(pts2.len() - 1).max(1);
+            let seg = cum[i] - cum[i - 1];
+            let t = if seg > 0.0 { (s - cum[i - 1]) / seg } else { 0.0 };
+            [pts2[i - 1][0] + t * (pts2[i][0] - pts2[i - 1][0]), pts2[i - 1][1] + t * (pts2[i][1] - pts2[i - 1][1])]
+        };
+        let n = 24;
+        let bottom: Vec<P3> = (0..=n)
+            .map(|q| {
+                let x = at(t0 + (t1 - t0) * q as f64 / n as f64);
+                let p3 = sk.frame.to_3d(x);
+                [p3[0], p3[1], zlo]
+            })
+            .collect();
+        let top: Vec<P3> = bottom.iter().rev().map(|p| [p[0], p[1], zhi]).collect();
+        let note = format!("wall of {} along {} ({:.2}..{:.2}), z {:.3}..{:.3} in", extrude, entity, t0, t1, zlo / 0.0254, zhi / 0.0254);
+        Ok((sk.feature_id.clone(), Profile::from_pieces(&[bottom, top]), note))
+    }
+
     /// A profile is one or more regions of one sketch; several merge into
     /// one face by union.
-    fn profile_region(&self, sels: &[RegionSel]) -> Result<(&SolvedSketch, Region), String> {
+    fn profile_region(&self, sels: &[RegionSel]) -> Result<(String, Region, String), String> {
         let mut regions: Vec<Region> = Vec::new();
-        let mut sketch: Option<&SolvedSketch> = None;
+        let mut sketch: Option<String> = None;
         let mut missing = Vec::new();
         for sel in sels {
             match self.region_of(sel) {
                 Ok((sk, r)) => {
-                    if sketch.is_some_and(|s| s.feature_id != sk.feature_id) {
+                    if sketch.as_ref().is_some_and(|s| *s != sk.feature_id) {
                         return Err("profile regions from different sketches".into());
                     }
-                    sketch = Some(sk);
+                    sketch = Some(sk.feature_id.clone());
                     regions.push(r.clone());
                 }
                 Err(e) => missing.push(e),
             }
         }
-        let sk = sketch.ok_or_else(|| format!("profile without regions: {}", missing.join("; ")))?;
+        let sk_id = sketch.ok_or_else(|| format!("profile without regions: {}", missing.join("; ")))?;
+        let note = format!("{} regions [{}]{}", regions.len(), regions.iter().map(|r| format!("{:.1}", r.area / (0.0254 * 0.0254))).collect::<Vec<_>>().join("/"), if missing.is_empty() { String::new() } else { format!(" missing {}", missing.len()) });
         let merged = if regions.len() == 1 {
             regions.pop().unwrap()
         } else {
@@ -352,7 +410,7 @@ impl Exec {
             }
             acc.pop().unwrap()
         };
-        Ok((sk, merged))
+        Ok((sk_id, merged, note))
     }
 
     /// A guide as a 3D polyline: its curves chained end to end.
@@ -412,13 +470,63 @@ impl Exec {
         if profiles.len() != 2 {
             return Err(format!("loft with {} profiles", profiles.len()));
         }
-        let (sa, ra) = self.profile_region(&profiles[0])?;
-        let (sb, rb) = self.profile_region(&profiles[1])?;
-        let (ra, rb) = (&ra, &rb);
-        let pa = self.profile_of(sa, ra);
-        let pb = self.profile_of(sb, rb);
+        // Each profile: merged regions, or a wall face (no cap then).
+        let mut caps: Vec<(String, Region)> = Vec::new();
+        let mut planes: Vec<([f64; 3], [f64; 3])> = Vec::new();
+        let mut make = |sels: &[RegionSel]| -> Result<(Profile, String), String> {
+            if sels.len() == 1 && sels[0].wall.is_some() {
+                let (_, prof, note) = self.wall_profile(&sels[0])?;
+                // The wall's plane: through its first point, normal across the wall.
+                let n = prof.points.len() / 2;
+                let (p0, p1) = (prof.points[0], prof.points[(n - 1).max(1)]);
+                let d = [p1[0] - p0[0], p1[1] - p0[1], 0.0];
+                let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-12);
+                planes.push((p0, [-d[1] / l, d[0] / l, 0.0]));
+                Ok((prof, note))
+            } else {
+                let (id, r, note) = self.profile_region(sels)?;
+                let sk = self.sketches.get(&id).unwrap();
+                let prof = self.profile_of(sk, &r);
+                planes.push((sk.frame.origin, sk.normal));
+                caps.push((id, r));
+                Ok((prof, note))
+            }
+        };
+        let (pa, note_a) = make(&profiles[0])?;
+        let (pb, note_b) = make(&profiles[1])?;
+        // Trim a guide to the profile planes (Onshape's trimGuidesByProfiles):
+        // keep the part between its crossings of the two planes, if any.
+        let trim = |poly: &[P3]| -> Vec<P3> {
+            let cross_at = |plane: &([f64; 3], [f64; 3])| -> Option<(usize, f64)> {
+                let (o, n) = plane;
+                let sd = |p: &P3| (p[0] - o[0]) * n[0] + (p[1] - o[1]) * n[1] + (p[2] - o[2]) * n[2];
+                for i in 0..poly.len() - 1 {
+                    let (a, b) = (sd(&poly[i]), sd(&poly[i + 1]));
+                    if (a <= 0.0 && b > 0.0) || (a >= 0.0 && b < 0.0) || a == 0.0 {
+                        let t = if (b - a).abs() > 1e-15 { a / (a - b) } else { 0.0 };
+                        return Some((i, t.clamp(0.0, 1.0)));
+                    }
+                }
+                None
+            };
+            let ca = cross_at(&planes[0]);
+            let cb = cross_at(&planes[1]);
+            let (Some(x0), Some(x1)) = (ca, cb) else { return poly.to_vec() };
+            let (lo, hi) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
+            let at = |(i, t): (usize, f64)| -> P3 {
+                let (a, b) = (poly[i], poly[i + 1]);
+                [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2] + t * (b[2] - a[2])]
+            };
+            let mut out = vec![at(lo)];
+            for i in lo.0 + 1..=hi.0 {
+                out.push(poly[i]);
+            }
+            out.push(at(hi));
+            out.dedup_by(|a, b| (a[0] - b[0]).abs() + (a[1] - b[1]).abs() + (a[2] - b[2]).abs() < 1e-9);
+            if out.len() >= 2 { out } else { poly.to_vec() }
+        };
         let label = p.index as u32 * 16;
-        let mut guide_note = String::new();
+        let mut guide_note = format!("; A {note_a} in2, B {note_b} in2");
         let mut side_tris: Vec<[P3; 3]> = Vec::new();
         // Guides that reach both profiles define Coons panels between them.
         let mut attached: Vec<(f64, f64, Vec<P3>)> = Vec::new(); // (s on A, s on B, polyline from A to B)
@@ -428,7 +536,8 @@ impl Exec {
         let mut skipped = 0;
         for g in guides {
             match self.guide_polyline(g) {
-                Ok(mut poly) => {
+                Ok(raw) => {
+                    let mut poly = trim(&raw);
                     let (s0a, d0a) = pa.nearest(&ca, poly[0]);
                     let (s0b, d0b) = pb.nearest(&cb, poly[0]);
                     let (s1a, d1a) = pa.nearest(&ca, *poly.last().unwrap());
@@ -441,6 +550,7 @@ impl Exec {
                         (s1a, s0b, d1a, d0b)
                     };
                     if da > 5e-3 || db > 5e-3 {
+                        guide_note.push_str(&format!("; guide off profiles by {:.1}/{:.1} mm", da * 1e3, db * 1e3));
                         skipped += 1;
                         continue;
                     }
@@ -451,6 +561,12 @@ impl Exec {
                     skipped += 1;
                 }
             }
+        }
+        if attached.len() == 1 {
+            // One guide fixes no pairing around the loops; the vertex-matched
+            // ruled surface is the better design equivalent.
+            guide_note.push_str("; 1 guide: ruled surface");
+            attached.clear();
         }
         if !attached.is_empty() {
             attached.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
@@ -463,7 +579,25 @@ impl Exec {
                 let fwd = (b1 - b0).rem_euclid(lb);
                 inc += if fwd < lb / 2.0 { 1 } else { -1 };
             }
-            let flip_b = n >= 2 && inc < 0;
+            // With one guide the vote is silent: take the orientation of B
+            // whose rulings are shorter (the untwisted tube).
+            let flip_b = if n >= 2 {
+                inc < 0
+            } else {
+                let (s0a, s0b, _) = &attached[0];
+                let cost = |flip: bool| -> f64 {
+                    (0..32)
+                        .map(|q| {
+                            let u = q as f64 / 32.0;
+                            let a = pa.at(&ca, s0a + u * la);
+                            let sb = if flip { lb - (s0b + u * lb) } else { s0b + u * lb };
+                            let b = pb.at(&cb, sb);
+                            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+                        })
+                        .sum()
+                };
+                cost(true) < cost(false)
+            };
             let b_at = |s: f64| -> P3 { if flip_b { pb.at(&cb, lb - s) } else { pb.at(&cb, s) } };
             let sb_of = |s: f64| if flip_b { (lb - s).rem_euclid(lb) } else { s };
             for i in 0..n {
@@ -484,6 +618,7 @@ impl Exec {
                 let glen = |g: &[P3]| g.windows(2).map(|w| ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2) + (w[1][2] - w[0][2]).powi(2)).sqrt()).sum::<f64>();
                 let nu = ((da_.max(db_) / 2e-3).ceil() as usize).clamp(4, 96);
                 let nv = ((glen(g0).max(glen(g1)) / 2e-3).ceil() as usize).clamp(4, 96);
+                guide_note.push_str(&format!("; panel {i}: A {:.0}..{:.0}mm ({:.0}) B {:.0}..{:.0}mm ({:.0}) guides {:.0}/{:.0}mm", s0a * 1e3, (s0a + da_) * 1e3, la * 1e3, s0b * 1e3, (s0b + db_) * 1e3, lb * 1e3, glen(g0) * 1e3, glen(g1) * 1e3));
                 side_tris.extend(coons_triangles(&a, &b, g0, g1, nu, nv));
             }
             guide_note.push_str(&format!("; {} guides -> {} Coons panels{}", n, n, if flip_b { " (B reversed)" } else { "" }));
@@ -497,7 +632,9 @@ impl Exec {
         }
         let mut body = Body::empty(&self.grid);
         let mut cap_tris = Vec::new();
-        for (sk, r) in [(sa, ra), (sb, rb)] {
+        for (id, r) in &caps {
+            let sk = self.sketches.get(id).unwrap();
+            let r = r;
             if sk.normal[2].abs() > 1.0 - 1e-9 {
                 // Horizontal cap: exact region test at the plane height.
                 let world = region_to_world_xy(r, &sk.frame);
@@ -571,6 +708,17 @@ impl Exec {
             }
             if cells.cells.is_empty() && matches!(a, FaceSel::Wall(_)) {
                 cells = solid.edge_cells(side, FaceSel::Outline, b, self.wall_jump);
+            }
+            // Two caps at different heights meet across the newer one's wall.
+            if cells.cells.is_empty() {
+                if let (FaceSel::Cap(la), FaceSel::Cap(lb)) = (a, b) {
+                    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+                    let _ = lo;
+                    cells = solid.edge_cells(side, FaceSel::Cap(la), FaceSel::Wall(hi), self.wall_jump);
+                    if cells.cells.is_empty() {
+                        cells = solid.edge_cells(side, FaceSel::Cap(lb), FaceSel::Wall(hi), self.wall_jump);
+                    }
+                }
             }
             if let Some(hb) = e.hint_box {
                 // Keep the cells around the blend face (grown by the reach of
@@ -681,6 +829,18 @@ impl Exec {
                 }
             }
             summary.push(format!("tool {} columns, bottom {:.4}..{:.4} m", n, lo_min, lo_max));
+            if std::env::var("TOOL_ROW").is_ok() {
+                let y = std::env::var("TOOL_ROW").unwrap().parse::<f64>().unwrap_or(15.0) * 0.0254;
+                let j = ((y - ts.grid.y0) / ts.grid.pitch) as usize;
+                let mut row = Vec::new();
+                for i in (0..ts.grid.nx).step_by(2) {
+                    let k = ts.grid.idx(i, j);
+                    if !ts.bot[k].is_nan() {
+                        row.push(format!("{:.2}:{:.3}", ts.grid.x(i) / 0.0254, ts.bot[k] / 0.0254));
+                    }
+                }
+                summary.push(format!("tool bottom row y={:.1}in: {}", y / 0.0254, row.join(" ")));
+            }
             let body = Body { grid: ts.grid.clone(), lo: ts.bot.clone(), hi: ts.top.clone(), hi_label: None, lo_label: None };
             let hf_op = match op {
                 BoolOp::Add => Op::Add,

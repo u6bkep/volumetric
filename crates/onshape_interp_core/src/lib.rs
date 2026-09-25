@@ -81,6 +81,28 @@ impl SolvedSketch {
         frame_flipped: bool,
         eps: f64,
     ) -> SolvedSketch {
+        Self::from_entities_with_normal(feature_id, name, ents, frame, frame_flipped, None, eps)
+    }
+
+    /// [`from_entities`] with Onshape's sketch normal known (the plane's
+    /// normal from the API): it overrides the seed fit's handedness call,
+    /// which decides which way every arc turns.
+    pub fn from_entities_with_normal(
+        feature_id: &str,
+        name: &str,
+        ents: &[Entity3d],
+        frame: Frame,
+        frame_flipped: bool,
+        normal_hint: Option<[f64; 3]>,
+        eps: f64,
+    ) -> SolvedSketch {
+        let frame_flipped = match normal_hint {
+            Some(nh) => {
+                let n = cross3(frame.ex, frame.ey);
+                n[0] * nh[0] + n[1] * nh[1] + n[2] * nh[2] < 0.0
+            }
+            None => frame_flipped,
+        };
         let mut pieces = Vec::new();
         let mut construction = Vec::new();
         let mut points = HashMap::new();
@@ -91,6 +113,13 @@ impl SolvedSketch {
                 }
                 Geom3d::Line(a, b) if e.construction => {
                     construction.push(Piece { id: e.id.clone(), curve: Curve::Line { a: frame.to_2d(*a), b: frame.to_2d(*b) } });
+                }
+                Geom3d::Arc { center, clockwise, start, end, .. } if e.construction => {
+                    let ccw = if frame_flipped { *clockwise } else { !clockwise };
+                    construction.push(Piece { id: e.id.clone(), curve: Curve::arc_from_ends(frame.to_2d(*center), frame.to_2d(*start), frame.to_2d(*end), ccw) });
+                }
+                Geom3d::Circle { center, radius } if e.construction => {
+                    construction.push(Piece { id: e.id.clone(), curve: Curve::circle(frame.to_2d(*center), *radius) });
                 }
                 _ if e.construction => {}
                 Geom3d::Line(a, b) => {
