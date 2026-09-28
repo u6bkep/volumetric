@@ -201,6 +201,10 @@ pub struct IdTable {
     pub slots: HashMap<String, Entry>,
     #[serde(default)]
     pub edges: HashMap<String, Vec<EdgeRef>>,
+    /// Features suppressed at the configuration the table was built at
+    /// (their slots are absent, not unresolved).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<String>,
 }
 
 fn sorted_map<T: Serialize>(m: &HashMap<String, T>) -> serde_json::Value {
@@ -229,6 +233,9 @@ impl IdTable {
         map.insert("ids".into(), sorted_map(&self.entries));
         map.insert("slots".into(), sorted_map(&self.slots));
         map.insert("edges".into(), sorted_map(&self.edges));
+        if !self.suppressed.is_empty() {
+            map.insert("suppressed".into(), serde_json::to_value(&self.suppressed).unwrap());
+        }
         serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
     }
 

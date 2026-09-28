@@ -216,10 +216,15 @@ struct Resolver<'a> {
 }
 
 /// `(parameter, query index, id index, id)` for every id of a query-list
-/// parameter.
+/// parameter. A query the tree export left empty (the feature was
+/// suppressed at the export's configuration) is one slot with an empty id:
+/// the id table resolves it by its key.
 fn slot_ids(feature: &Json, param_id: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     for (qi, (_, ids)) in query_ids(feature, param_id).into_iter().enumerate() {
+        if ids.is_empty() {
+            out.push((qi, 0, String::new()));
+        }
         for (ii, id) in ids.into_iter().enumerate() {
             out.push((qi, ii, id));
         }
@@ -309,6 +314,11 @@ impl Resolver<'_> {
         }
         let mut out = Vec::new();
         for (qi, ii, id) in slot_ids(feature, param) {
+            // A query the export left empty names no edge: nothing to blend
+            // unless the observer path recorded the feature's edges above.
+            if id.is_empty() {
+                continue;
+            }
             match self.get(param, qi, ii, &id) {
                 Some(Ref::Edge { a, b, side, hint }) => out.push(EdgeSel { a, b, side, hint, hint_box: None, rails: None }),
                 Some(_) => self.unresolved.push(format!("{id} (not an edge)")),
@@ -585,6 +595,11 @@ pub fn feature_slots(feature: &Json) -> Vec<(String, usize, usize, Option<String
             let base = *counts.get(&pid).unwrap_or(&0);
             let qs = queries(m);
             for (qi, (fid, ids)) in qs.iter().enumerate() {
+                // An empty query (the export's configuration suppressed the
+                // feature) is one slot with an empty id, resolved by key.
+                if ids.is_empty() {
+                    out.push((pid.clone(), base + qi, 0, fid.clone(), String::new()));
+                }
                 for (ii, id) in ids.iter().enumerate() {
                     out.push((pid.clone(), base + qi, ii, fid.clone(), id.clone()));
                 }
