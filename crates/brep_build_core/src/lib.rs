@@ -5,6 +5,13 @@
 //! walls are planes and cylinders, every edge is an exact line or circle
 //! and every wall is named after the sketch entity it was swept from.
 
+pub mod conic;
+pub mod fit;
+pub mod lift;
+pub mod planmap;
+pub mod sheet;
+pub mod trace;
+
 use brep_core::ir::Surface;
 use brep_core::math::{Frame, Vec3, scale};
 use brep_core::topo::{Coedge, Curve3, Edge, Face, Solid};

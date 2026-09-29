@@ -169,6 +169,8 @@ struct Split {
     hes: Vec<HalfEdge>,
     /// Outgoing half-edges per vertex, sorted counter-clockwise.
     out: Vec<Vec<usize>>,
+    /// One position per vertex (the first end point snapped to it).
+    verts: Vec<P2>,
 }
 
 fn angle_key(h: &HalfEdge) -> (f64, f64) {
@@ -276,6 +278,11 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
         vertex_of[i] = v;
     }
     let nv = vid.len();
+    let mut verts: Vec<Option<P2>> = vec![None; nv];
+    for i in 0..m {
+        verts[vertex_of[i]].get_or_insert(ends[i]);
+    }
+    let verts: Vec<P2> = verts.into_iter().map(|v| v.unwrap_or([0.0, 0.0])).collect();
     // 4. Half-edges. Sub-pieces joining the same two vertices along the same
     // curve (a sketch line drawn twice, two rectangles sharing a side) are
     // one edge; the duplicate is dropped so it cannot separate a face from
@@ -340,7 +347,7 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
             }
         });
     }
-    Split { pieces, hes, out }
+    Split { pieces, hes, out, verts }
 }
 
 struct Face {
@@ -433,6 +440,89 @@ pub fn arrange(pieces: &[Piece], eps: f64) -> Vec<Region> {
     let split = build_split(pieces, eps);
     let faces = walk_faces(&split);
     assemble_regions(faces, eps)
+}
+
+/// One edge of an [`Arrangement`]: a piece between two vertices with the
+/// bounded faces on its two sides.
+#[derive(Clone, Debug)]
+pub struct ArrEdge {
+    /// The id of the input piece it is part of.
+    pub id: String,
+    /// From `from` to `to`.
+    pub curve: Curve,
+    pub from: usize,
+    pub to: usize,
+    /// Indices into [`Arrangement::faces`]; `None` is the unbounded face.
+    pub left: Option<usize>,
+    pub right: Option<usize>,
+}
+
+/// The arrangement of a set of pieces with its adjacency: what
+/// [`arrange`] walks, kept.
+#[derive(Clone, Debug)]
+pub struct Arrangement {
+    pub vertices: Vec<P2>,
+    pub edges: Vec<ArrEdge>,
+    pub faces: Vec<Region>,
+}
+
+/// The arrangement of `pieces` (see [`arrange`] for `eps`). Pieces that
+/// coincide are one edge, under the id of the first.
+pub fn arrangement(pieces: &[Piece], eps: f64) -> Arrangement {
+    let split = build_split(pieces, eps);
+    let loops = walk_faces(&split);
+    // Bounded faces are the positive loops; a negative loop is the outside
+    // of a connected group of edges, a hole of the smallest face around it.
+    let mut face_of_loop: Vec<Option<usize>> = vec![None; loops.len()];
+    let mut faces: Vec<Region> = Vec::new();
+    for (i, f) in loops.iter().enumerate() {
+        if f.area > eps * eps {
+            let ids = f.pieces.iter().map(|p| p.id.clone()).collect();
+            face_of_loop[i] = Some(faces.len());
+            faces.push(Region { outer: f.pieces.clone(), holes: Vec::new(), ids, area: f.area });
+        }
+    }
+    for (i, f) in loops.iter().enumerate() {
+        if f.area > -(eps * eps) {
+            continue;
+        }
+        let probe = face_probe(&f.pieces, 4.0 * eps);
+        let mut best: Option<(usize, f64)> = None;
+        for (k, r) in faces.iter().enumerate() {
+            if loop_winding(&r.outer, probe) > std::f64::consts::PI && best.is_none_or(|(_, a)| loop_area(&r.outer) < a) {
+                best = Some((k, loop_area(&r.outer)));
+            }
+        }
+        if let Some((k, _)) = best {
+            face_of_loop[i] = Some(k);
+            let r = &mut faces[k];
+            r.area += f.area;
+            for p in &f.pieces {
+                r.ids.insert(p.id.clone());
+            }
+            r.holes.push(f.pieces.clone());
+        }
+    }
+    let mut face_of_he: Vec<Option<usize>> = vec![None; split.hes.len()];
+    for (i, f) in loops.iter().enumerate() {
+        for &h in &f.hes {
+            face_of_he[h] = face_of_loop[i];
+        }
+    }
+    let edges = (0..split.hes.len() / 2)
+        .map(|e| {
+            let he = &split.hes[2 * e];
+            ArrEdge {
+                id: split.pieces[he.piece].id.clone(),
+                curve: he.curve,
+                from: he.from,
+                to: he.to,
+                left: face_of_he[2 * e],
+                right: face_of_he[2 * e + 1],
+            }
+        })
+        .collect();
+    Arrangement { vertices: split.verts, edges, faces }
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +666,40 @@ pub fn fillet_corner(pieces: &mut Vec<Piece>, i: usize, r: f64, id: &str) -> boo
 mod tests {
     use super::*;
     use std::f64::consts::PI;
+
+    #[test]
+    fn arrangement_knows_both_sides() {
+        // Two squares sharing a side, a circle inside the left one.
+        let mut pieces = rect("a", 0.0, 0.0, 1.0, 1.0);
+        pieces.extend(rect("b", 1.0, 0.0, 2.0, 1.0));
+        pieces.push(Piece { id: "c".into(), curve: Curve::circle([0.5, 0.5], 0.25) });
+        let arr = arrangement(&pieces, 1e-9);
+        assert_eq!(arr.faces.len(), 3);
+        assert_eq!(arr.edges.len(), 8, "the shared side is one edge");
+        let face_at = |p: P2| arr.faces.iter().position(|r| r.contains(p)).unwrap();
+        let (left, right, disc) = (face_at([0.1, 0.1]), face_at([1.5, 0.5]), face_at([0.5, 0.5]));
+        let shared: Vec<&ArrEdge> = arr.edges.iter().filter(|e| (e.curve.point(0.5)[0] - 1.0).abs() < 1e-12).collect();
+        assert_eq!(shared.len(), 1);
+        let mut sides = [shared[0].left, shared[0].right];
+        sides.sort();
+        let mut expect = [Some(left), Some(right)];
+        expect.sort();
+        assert_eq!(sides, expect);
+        let ring = arr.edges.iter().find(|e| e.id == "c").unwrap();
+        assert_eq!(ring.from, ring.to);
+        let mut sides = [ring.left, ring.right];
+        sides.sort();
+        let mut expect = [Some(left), Some(disc)];
+        expect.sort();
+        assert_eq!(sides, expect);
+        // Every outer edge has the unbounded face on one side.
+        assert_eq!(arr.edges.iter().filter(|e| e.left.is_none() || e.right.is_none()).count(), 6);
+        assert!((arr.faces[left].area - (1.0 - PI * 0.0625)).abs() < 1e-12);
+        for e in &arr.edges {
+            assert!(dist(arr.vertices[e.from], e.curve.start()) < 1e-9);
+            assert!(dist(arr.vertices[e.to], e.curve.end()) < 1e-9);
+        }
+    }
 
     fn line(id: &str, a: P2, b: P2) -> Piece {
         Piece { id: id.to_string(), curve: Curve::Line { a, b } }
