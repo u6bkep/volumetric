@@ -10,8 +10,11 @@
 //! Inputs are the feature JSON (Features API, with ids), the evaluated
 //! variable scope, and the sketches already solved at the configuration
 //! ([`SolvedSketch`]: plane frame plus 2D curves). Output is a
-//! [`heightfield_core::Solid`] and a per-feature report.
+//! [`heightfield_core::Solid`] and a per-feature report ([`exec`]), or
+//! the same steps on exact surfaces, as plan maps that lift to boundary
+//! representations ([`brep`]).
 
+pub mod brep;
 pub mod exec;
 pub mod idtable;
 pub mod plan;

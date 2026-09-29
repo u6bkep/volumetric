@@ -287,7 +287,10 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
     // curve (a sketch line drawn twice, two rectangles sharing a side) are
     // one edge; the duplicate is dropped so it cannot separate a face from
     // itself. Loops (u == v) are full circles and are always distinct.
-    let mut seen: HashMap<(usize, usize, i64, i64), usize> = HashMap::new();
+    // (The middles are compared by distance: rounded to a grid, two
+    // within a rounding error of each other can fall either side of a
+    // grid line.)
+    let mut seen: HashMap<(usize, usize), Vec<P2>> = HashMap::new();
     let mut hes: Vec<HalfEdge> = Vec::with_capacity(2 * pieces.len());
     for (k, p) in pieces.iter().enumerate() {
         let u = vertex_of[2 * k];
@@ -295,11 +298,11 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
         if u != v {
             let (lo, hi) = if u < v { (u, v) } else { (v, u) };
             let mid = p.curve.point(0.5);
-            let key = (lo, hi, (mid[0] / eps).round() as i64, (mid[1] / eps).round() as i64);
-            if seen.contains_key(&key) {
+            let mids = seen.entry((lo, hi)).or_default();
+            if mids.iter().any(|m| dist(*m, mid) <= 2.0 * eps) {
                 continue;
             }
-            seen.insert(key, k);
+            mids.push(mid);
         }
         let f = hes.len();
         hes.push(HalfEdge { from: u, to: v, curve: p.curve, piece: k, twin: f + 1 });
@@ -870,3 +873,35 @@ mod corner_tests {
 
 
 
+
+#[cfg(test)]
+mod strips {
+    use super::*;
+
+    #[test]
+    fn coincident_pieces_with_middles_a_rounding_error_apart() {
+        // Three strips side by side, their ends drawn twice: once per
+        // strip and once across all three. The middle of the third
+        // strip's end is 0.24209375, half way between two multiples of
+        // the tolerance.
+        let l = |id: &str, a: P2, b: P2| Piece { id: id.into(), curve: Curve::Line { a, b } };
+        let pieces = vec![
+            l("s0", [0.17780000000000057, 8.4826], [0.2016125000000003, 8.4826]),
+            l("s1", [0.2016125, 8.4826], [0.2301875, 8.4826]),
+            l("s2", [0.23018749999999985, 8.4826], [0.2539999999999998, 8.4826]),
+            l("s3", [0.254, 8.4826], [0.1778, 8.4826]),
+            l("e0", [0.17780000000000057, 0.3302], [0.2016125000000003, 0.3302]),
+            l("e1", [0.2016125, 0.3302], [0.2301875, 0.3302]),
+            l("e2", [0.23018749999999985, 0.3302], [0.2539999999999998, 0.3302]),
+            l("e3", [0.254, 0.3302], [0.1778, 0.3302]),
+            l("p0", [0.17780000000000057, 8.4826], [0.17780000000000057, 0.3302]),
+            l("p1", [0.2016125, 8.4826], [0.2016125, 0.3302]),
+            l("p2", [0.23018749999999985, 8.4826], [0.23018749999999985, 0.3302]),
+            l("p3", [0.254, 8.4826], [0.254, 0.3302]),
+        ];
+        let arr = arrangement(&pieces, 1e-7);
+        assert_eq!(arr.faces.len(), 3);
+        assert_eq!(arr.edges.len(), 10);
+        assert_eq!(arrange(&pieces, 1e-7).len(), 3);
+    }
+}

@@ -401,6 +401,7 @@ name = "brep_build_core"
 version = "0.1.0"
 dependencies = [
  "brep_core",
+ "heightfield_core",
  "sketch_regions_core",
 ]
 
@@ -4023,6 +4024,8 @@ dependencies = [
 name = "onshape_interp_core"
 version = "0.1.0"
 dependencies = [
+ "brep_build_core",
+ "brep_core",
  "fs_expr",
  "heightfield_core",
  "onshape_import_core",

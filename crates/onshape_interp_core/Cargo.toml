@@ -10,4 +10,6 @@ serde_json = "1"
 fs_expr = { path = "../fs_expr" }
 sketch_regions_core = { path = "../sketch_regions_core" }
 heightfield_core = { path = "../heightfield_core" }
+brep_build_core = { path = "../brep_build_core" }
+brep_core = { path = "../brep_core" }
 onshape_import_core = { path = "../onshape_import_core" }

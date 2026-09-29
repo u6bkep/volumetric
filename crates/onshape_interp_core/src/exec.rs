@@ -128,6 +128,40 @@ fn region_to_world_xy(region: &Region, frame: &Frame) -> Vec<Region> {
     arrange(&pieces, 1e-7)
 }
 
+/// Sweep extents along `dir` for the bounds, from the plane origin.
+/// An up-to-vertex bound ends at the plane through the vertex parallel
+/// to the sketch plane (`normal`), whatever the sweep direction.
+pub fn sweep_extent(origin: [f64; 3], normal: [f64; 3], dir: [f64; 3], end: &Bound, second: &Option<Bound>) -> Result<(f64, f64), String> {
+    let along = |b: &Bound| -> Result<f64, String> {
+        Ok(match b {
+            Bound::Blind(d) => *d,
+            Bound::ThroughAll => f64::INFINITY,
+            Bound::UpToPlane { origin: po, normal: pn } => {
+                let den = dot3(dir, *pn);
+                if den.abs() < 1e-9 {
+                    return Err(format!("up-to plane (normal {pn:?}) is parallel to the sweep {dir:?}"));
+                }
+                dot3(sub3(*po, origin), *pn) / den
+            }
+            Bound::UpToPoint(p) => {
+                let den = dot3(dir, normal);
+                if den.abs() < 1e-9 {
+                    return Err("sweep direction lies in the sketch plane".into());
+                }
+                dot3(sub3(*p, origin), normal) / den
+            }
+        })
+    };
+    let e = along(end)?;
+    let (mut w0, mut w1) = (e.min(0.0), e.max(0.0));
+    if let Some(s) = second {
+        let v = -along(s)?;
+        w0 = w0.min(v);
+        w1 = w1.max(v);
+    }
+    Ok((w0, w1))
+}
+
 impl Exec {
     /// Cell labels are `feature index * LABEL_FACES + face`: face 0 is a
     /// feature's cap (or its only surface), the rest a loft's side panels
@@ -306,38 +340,8 @@ impl Exec {
         Ok(targets.to_vec())
     }
 
-    /// Sweep extents along `dir` for the bounds, from the plane origin.
-    /// An up-to-vertex bound ends at the plane through the vertex parallel
-    /// to the sketch plane (`normal`), whatever the sweep direction.
     fn sweep(&self, origin: [f64; 3], normal: [f64; 3], dir: [f64; 3], end: &Bound, second: &Option<Bound>) -> Result<(f64, f64), String> {
-        let along = |b: &Bound| -> Result<f64, String> {
-            Ok(match b {
-                Bound::Blind(d) => *d,
-                Bound::ThroughAll => f64::INFINITY,
-                Bound::UpToPlane { origin: po, normal: pn } => {
-                    let den = dot3(dir, *pn);
-                    if den.abs() < 1e-9 {
-                        return Err(format!("up-to plane (normal {pn:?}) is parallel to the sweep {dir:?}"));
-                    }
-                    dot3(sub3(*po, origin), *pn) / den
-                }
-                Bound::UpToPoint(p) => {
-                    let den = dot3(dir, normal);
-                    if den.abs() < 1e-9 {
-                        return Err("sweep direction lies in the sketch plane".into());
-                    }
-                    dot3(sub3(*p, origin), normal) / den
-                }
-            })
-        };
-        let e = along(end)?;
-        let (mut w0, mut w1) = (e.min(0.0), e.max(0.0));
-        if let Some(s) = second {
-            let v = -along(s)?;
-            w0 = w0.min(v);
-            w1 = w1.max(v);
-        }
-        Ok((w0, w1))
+        sweep_extent(origin, normal, dir, end, second)
     }
 
     fn apply_to_targets(&mut self, targets: &[String], body: &Body, op: Op, label: u32) -> String {
