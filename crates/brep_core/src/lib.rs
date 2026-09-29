@@ -21,6 +21,10 @@
 //! Trim error is tangential along the exact surface, far below any
 //! downstream meshing resolution.
 //!
+//! [`topo`] is the other representation of the same solids: shared
+//! vertices and edges with exact curves, which is what a constructing
+//! kernel builds and a STEP writer needs. It lowers into the IR.
+//!
 //! # Inside/outside semantics
 //!
 //! Occupancy is the union over instances. Per solid, classification is
@@ -110,6 +114,11 @@
 //!       Loops are closed implicitly (last connects to first) and stored
 //!       *unwrapped*: on periodic surfaces consecutive points continue
 //!       past the seam rather than jumping back into the base period.
+//!       A loop that runs once around a periodic axis (the rim of a
+//!       seamless cylinder: exporters built on Parasolid write no seam
+//!       edge) therefore ends a period from where it began; it closes
+//!       onto the next alias of its first point, not back across the
+//!       face.
 //! ```
 //!
 //! A frame is 12 f64: origin, then orthonormal basis rows x, y, z.
@@ -123,6 +132,7 @@ pub mod nurbs;
 pub mod payload;
 pub mod project;
 pub mod surface;
+pub mod topo;
 pub mod trim;
 
 pub const MAGIC: u32 = 0x3150_5242; // "BRP1"

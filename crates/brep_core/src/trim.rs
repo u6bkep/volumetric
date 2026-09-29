@@ -52,24 +52,57 @@ impl LoopSet for &[Vec<[f64; 2]>] {
     }
 }
 
+/// How a loop closes on the periodic axes: the whole periods between
+/// its first and its last point. A loop that runs once around a periodic
+/// axis (the rim of a seamless cylinder, which has no seam edge to turn
+/// back along) ends a period from where it began, and its closing
+/// segment joins the last point to the first point's next alias.
+fn winding<L: TrimLoop>(lp: &L, period: [f64; 2]) -> [f64; 2] {
+    let n = lp.len();
+    let mut off = [0.0; 2];
+    if n == 0 {
+        return off;
+    }
+    let first = lp.point(0);
+    let last = lp.point(n - 1);
+    for a in 0..2 {
+        if period[a] > 0.0 {
+            off[a] = ((last[a] - first[a]) / period[a]).round() * period[a];
+        }
+    }
+    off
+}
+
 /// Even-odd parity of `(u, v)` against one closed loop, plus the squared
-/// distance from the point to the loop in eps-normalized UV. The
-/// half-open crossing rule (`v0 <= v < v1`) keeps shared polyline
-/// vertices from double-counting.
-fn loop_parity_and_dist2<L: TrimLoop>(lp: &L, u: f64, v: f64, inv_eps: [f64; 2]) -> (bool, f64) {
+/// distance from the point to the loop in eps-normalized UV. The ray
+/// runs along +u, or along +v when `ray_v`; `wind` is the loop's
+/// [`winding`]. The half-open crossing rule (`v0 <= v < v1`) keeps
+/// shared polyline vertices from double-counting.
+fn loop_parity_and_dist2<L: TrimLoop>(
+    lp: &L,
+    u: f64,
+    v: f64,
+    inv_eps: [f64; 2],
+    wind: [f64; 2],
+    ray_v: bool,
+) -> (bool, f64) {
     let n = lp.len();
     if n == 0 {
         return (false, f64::INFINITY);
     }
+    // Along the ray / across it.
+    let (along, across) = if ray_v { (1, 0) } else { (0, 1) };
+    let q = [u, v];
     let mut inside = false;
     let mut dist2 = f64::INFINITY;
-    let mut prev = lp.point(n - 1);
+    let last = lp.point(n - 1);
+    let mut prev = [last[0] - wind[0], last[1] - wind[1]];
     for i in 0..n {
         let cur = lp.point(i);
-        if (prev[1] <= v) != (cur[1] <= v) {
-            let t = (v - prev[1]) / (cur[1] - prev[1]);
-            let cross_u = prev[0] + t * (cur[0] - prev[0]);
-            if cross_u > u {
+        if (prev[across] <= q[across]) != (cur[across] <= q[across]) {
+            let t = (q[across] - prev[across]) / (cur[across] - prev[across]);
+            let cross = prev[along] + t * (cur[along] - prev[along]);
+            if cross > q[along] {
                 inside = !inside;
             }
         }
@@ -137,16 +170,53 @@ impl<S: LoopSet> Region<S> {
         let (u_shifts, nu) = period_shifts(u, self.u_period, self.uv_aabb[0], self.uv_aabb[1]);
         let (v_shifts, nv) = period_shifts(v, self.v_period, self.uv_aabb[2], self.uv_aabb[3]);
 
+        let period = [self.u_period, self.v_period];
+        let mut wound = [false; 2];
+        if period[0] > 0.0 || period[1] > 0.0 {
+            for i in 0..self.loops.len() {
+                let w = winding(&self.loops.at(i), period);
+                wound[0] |= w[0] != 0.0;
+                wound[1] |= w[1] != 0.0;
+            }
+        }
+
         let mut inside = false;
         let mut near = false;
-        for &us in &u_shifts[..nu] {
-            for &vs in &v_shifts[..nv] {
+        if !wound[0] && !wound[1] {
+            for &us in &u_shifts[..nu] {
+                for &vs in &v_shifts[..nv] {
+                    let mut parity = false;
+                    for i in 0..self.loops.len() {
+                        let lp = self.loops.at(i);
+                        let (odd, d2) =
+                            loop_parity_and_dist2(&lp, us, vs, inv_eps, [0.0; 2], false);
+                        parity ^= odd;
+                        near |= d2 < 1.0;
+                    }
+                    inside |= parity;
+                }
+            }
+        } else {
+            // Loops run around a periodic axis: the ray goes along the
+            // other axis, and on the wound axis every alias of the query
+            // is a copy of that one ray, so its crossings add up.
+            let ray_v = wound[0];
+            let (sum, sum_n, any, any_n) = if ray_v {
+                (u_shifts, nu, v_shifts, nv)
+            } else {
+                (v_shifts, nv, u_shifts, nu)
+            };
+            for &a in &any[..any_n] {
                 let mut parity = false;
-                for i in 0..self.loops.len() {
-                    let lp = self.loops.at(i);
-                    let (odd, d2) = loop_parity_and_dist2(&lp, us, vs, inv_eps);
-                    parity ^= odd;
-                    near |= d2 < 1.0;
+                for &s in &sum[..sum_n] {
+                    let (us, vs) = if ray_v { (s, a) } else { (a, s) };
+                    for i in 0..self.loops.len() {
+                        let lp = self.loops.at(i);
+                        let w = winding(&lp, period);
+                        let (odd, d2) = loop_parity_and_dist2(&lp, us, vs, inv_eps, w, ray_v);
+                        parity ^= odd;
+                        near |= d2 < 1.0;
+                    }
                 }
                 inside |= parity;
             }
@@ -189,7 +259,9 @@ impl<S: LoopSet> Region<S> {
                     if n == 0 {
                         continue;
                     }
-                    let mut prev = lp.point(n - 1);
+                    let w = winding(&lp, [self.u_period, self.v_period]);
+                    let last = lp.point(n - 1);
+                    let mut prev = [last[0] - w[0], last[1] - w[1]];
                     for j in 0..n {
                         let cur = lp.point(j);
                         let du = [
@@ -314,6 +386,41 @@ mod tests {
         assert!(r.contains(0.25, 0.5).inside);
         assert!(!r.contains(1.0, 0.5).inside);
         assert!(!r.contains(TAU - 1.0, 0.5).inside);
+    }
+
+    #[test]
+    fn seamless_band_between_two_rims() {
+        use core::f64::consts::TAU;
+        // A full cylinder band, v in [0, 1]: each rim is one loop that
+        // runs once around u, from different start angles, the closing
+        // point omitted.
+        let rim = |u0: f64, v: f64, dir: f64| -> Vec<[f64; 2]> {
+            (0..32)
+                .map(|i| [u0 + dir * TAU * i as f64 / 32.0, v])
+                .collect()
+        };
+        let loops = vec![rim(0.3, 0.0, 1.0), rim(2.5, 1.0, -1.0)];
+        let r = region(&loops, TAU, 0.0);
+        for k in 0..40 {
+            let u = -7.0 + 0.41 * k as f64;
+            assert!(r.contains(u, 0.5).inside, "u = {u}");
+            assert!(!r.contains(u, -0.5).inside, "below, u = {u}");
+            assert!(!r.contains(u, 1.5).inside, "above, u = {u}");
+        }
+        // With a window cut out of the band.
+        let mut loops = loops;
+        loops.push(vec![[1.0, 0.25], [2.0, 0.25], [2.0, 0.75], [1.0, 0.75]]);
+        let r = region(&loops, TAU, 0.0);
+        assert!(!r.contains(1.5, 0.5).inside);
+        assert!(!r.contains(1.5 + TAU, 0.5).inside);
+        assert!(r.contains(0.5, 0.5).inside);
+        assert!(r.contains(1.5, 0.1).inside);
+        assert!(r.contains(4.0 - TAU, 0.5).inside);
+        let b = r.nearest_boundary_uv(0.29, 0.1);
+        assert!(
+            (b[1] - 0.0).abs() < 1e-12 && (b[0] - 0.29).abs() < 1e-9,
+            "{b:?}"
+        );
     }
 
     #[test]

@@ -290,6 +290,234 @@ fn subdivide<C: CurveData>(
     }
 }
 
+/// Where the parameter `axis` of `surface` ends in a point (a sphere's
+/// poles, a cone's apex) on the `side` (+1 / -1) of `from`.
+fn pole(surface: &Surface, axis: usize, side: f64, from: f64) -> Option<f64> {
+    use core::f64::consts::FRAC_PI_2;
+    if axis != 1 {
+        return None;
+    }
+    match surface {
+        Surface::Sphere { .. } => Some(side * FRAC_PI_2),
+        Surface::Cone {
+            radius, half_angle, ..
+        } => {
+            let t = half_angle.tan();
+            if t == 0.0 {
+                return None;
+            }
+            let apex = -radius / t;
+            ((apex - from) * side > 0.0).then_some(apex)
+        }
+        _ => None,
+    }
+}
+
+fn mean(lp: &[[f64; 2]], axis: usize) -> f64 {
+    lp.iter().map(|p| p[axis]).sum::<f64>() / lp.len().max(1) as f64
+}
+
+fn uv_inside(lp: &[[f64; 2]], q: [f64; 2]) -> bool {
+    let mut inside = false;
+    let mut prev = lp[lp.len() - 1];
+    for &cur in lp {
+        if (prev[1] <= q[1]) != (cur[1] <= q[1]) {
+            let t = (q[1] - prev[1]) / (cur[1] - prev[1]);
+            if prev[0] + t * (cur[0] - prev[0]) > q[0] {
+                inside = !inside;
+            }
+        }
+        prev = cur;
+    }
+    inside
+}
+
+fn uv_area(lp: &[[f64; 2]]) -> f64 {
+    let mut a = 0.0;
+    let mut prev = lp[lp.len() - 1];
+    for &cur in lp {
+        a += prev[0] * cur[1] - cur[0] * prev[1];
+        prev = cur;
+    }
+    0.5 * a
+}
+
+/// Bring the loops of one face, each unwrapped on its own, into one
+/// consistent picture of the face in UV, using what the even-odd trim
+/// test cannot know: which side of a loop the face is on.
+///
+/// `loops` run with the face on their left seen against the face's
+/// outward normal (loop `i` the other way round when `reversed[i]`), and
+/// the outward normal is the surface normal when `same_sense`.
+///
+/// - A loop that runs once around a periodic axis has the face on one
+///   side only. Two of them bound a band: on a torus the second is moved
+///   by whole periods to the far side of the first. One alone bounds a
+///   cap, and the loop the cap lacks is added where the surface ends: a
+///   sphere's pole, a cone's apex, the first loop's own next alias on a
+///   torus.
+/// - Every other loop is moved by whole periods into the loop or band
+///   that holds it (a hole unwrapped from the far side of the seam).
+pub fn settle_periodic(
+    surface: &Surface,
+    same_sense: bool,
+    loops: &mut Vec<Vec<[f64; 2]>>,
+    reversed: &[bool],
+) -> Result<(), String> {
+    let (pu, pv) = surface.periods();
+    let period = [pu, pv];
+    if (pu <= 0.0 && pv <= 0.0) || loops.is_empty() {
+        return Ok(());
+    }
+    // Whole periods each loop advances, per axis.
+    let mut wound: Vec<[f64; 2]> = Vec::with_capacity(loops.len());
+    for lp in loops.iter() {
+        let mut w = [0.0; 2];
+        if let (Some(first), Some(last)) = (lp.first(), lp.last()) {
+            for a in 0..2 {
+                if period[a] > 0.0 {
+                    w[a] = ((last[a] - first[a]) / period[a]).round();
+                }
+            }
+        }
+        if w[0] != 0.0 && w[1] != 0.0 {
+            return Err("a loop winds around both axes of the surface".into());
+        }
+        wound.push(w);
+    }
+
+    // The band or cap: `axis` is the wound one, `across` the other.
+    let mut band: Option<(usize, f64, f64)> = None;
+    for axis in 0..2 {
+        let across = 1 - axis;
+        let mut floor: Option<usize> = None;
+        let mut ceiling: Option<usize> = None;
+        for (i, w) in wound.iter().enumerate() {
+            if w[axis] == 0.0 {
+                continue;
+            }
+            // Travelling along +u the left is +v; along +v it is -u.
+            // Seen from behind the surface, or run backwards, the sides
+            // swap.
+            let mut side = w[axis].signum() * if axis == 0 { 1.0 } else { -1.0 };
+            if !same_sense {
+                side = -side;
+            }
+            if reversed.get(i).copied().unwrap_or(false) {
+                side = -side;
+            }
+            let slot = if side > 0.0 { &mut floor } else { &mut ceiling };
+            if slot.replace(i).is_some() {
+                return Err(
+                    "several loops around the same axis on the same side of the face".into(),
+                );
+            }
+        }
+        if floor.is_none() && ceiling.is_none() {
+            continue;
+        }
+        if band.is_some() {
+            return Err("loops wind around both axes of the surface".into());
+        }
+        let (lo, hi) = match (floor, ceiling) {
+            (Some(f), Some(c)) => {
+                let lo = mean(&loops[f], across);
+                let mut hi = mean(&loops[c], across);
+                if period[across] > 0.0 {
+                    let k = ((lo - hi) / period[across]).floor() + 1.0;
+                    if k != 0.0 {
+                        for p in loops[c].iter_mut() {
+                            p[across] += k * period[across];
+                        }
+                        hi += k * period[across];
+                    }
+                } else if hi <= lo {
+                    return Err("the loops around the surface have the face outside them".into());
+                }
+                (lo, hi)
+            }
+            (one, other) => {
+                let (i, side) = match (one, other) {
+                    (Some(f), None) => (f, 1.0),
+                    (None, Some(c)) => (c, -1.0),
+                    _ => unreachable!(),
+                };
+                let from = mean(&loops[i], across);
+                let mut added = loops[i].clone();
+                let to = if period[across] > 0.0 {
+                    for p in added.iter_mut() {
+                        p[across] += side * period[across];
+                    }
+                    from + side * period[across]
+                } else if let Some(end) = pole(surface, across, side, from) {
+                    for p in added.iter_mut() {
+                        p[across] = end;
+                    }
+                    end
+                } else {
+                    return Err(
+                        "one loop around the surface, which does not end on the face's side of it"
+                            .into(),
+                    );
+                };
+                loops.push(added);
+                wound.push(wound[i]);
+                (from.min(to), from.max(to))
+            }
+        };
+        band = Some((across, lo, hi));
+    }
+
+    // The loop that holds the others when nothing winds.
+    let outer = if band.is_none() {
+        (0..loops.len()).max_by(|&a, &b| {
+            uv_area(&loops[a])
+                .abs()
+                .total_cmp(&uv_area(&loops[b]).abs())
+        })
+    } else {
+        None
+    };
+    for i in 0..loops.len() {
+        if wound[i] != [0.0, 0.0] || Some(i) == outer || loops[i].is_empty() {
+            continue;
+        }
+        let mut shift = [0.0; 2];
+        if let Some((across, lo, hi)) = band {
+            if period[across] > 0.0 {
+                let m = mean(&loops[i], across);
+                let mid = 0.5 * (lo + hi);
+                shift[across] = ((mid - m) / period[across]).round() * period[across];
+            }
+        } else if let Some(o) = outer {
+            let first = loops[i][0];
+            let mut found = uv_inside(&loops[o], first);
+            'search: for ku in [0.0, -1.0, 1.0] {
+                for kv in [0.0, -1.0, 1.0] {
+                    if found {
+                        break 'search;
+                    }
+                    if (ku != 0.0 && pu <= 0.0) || (kv != 0.0 && pv <= 0.0) {
+                        continue;
+                    }
+                    let q = [first[0] + ku * pu.max(0.0), first[1] + kv * pv.max(0.0)];
+                    if uv_inside(&loops[o], q) {
+                        shift = [ku * pu.max(0.0), kv * pv.max(0.0)];
+                        found = true;
+                    }
+                }
+            }
+        }
+        if shift != [0.0, 0.0] {
+            for p in loops[i].iter_mut() {
+                p[0] += shift[0];
+                p[1] += shift[1];
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Sanity check that a projected UV loop actually lies on the surface:
 /// re-evaluate each UV point and compare with the source 3D point.
 /// Cheap insurance against branch/seam mistakes in importers.

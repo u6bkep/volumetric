@@ -546,7 +546,8 @@ fn convert_face(ctx: &Ctx, face_id: u64, opts: &Options) -> Result<Face, String>
     let step_surface = ctx
         .surface(surface_id)
         .map_err(|e| format!("surface: {e}"))?;
-    let surface = lower_surface(step_surface, opts)?;
+    let (surface, flipped) = lower_surface(step_surface, opts)?;
+    let (same_sense, as_listed) = ctx.face_senses(face_id)?;
 
     let proj_tol = opts.chord_tol * 4.0 + 1e-6;
     let mut trims = Vec::new();
@@ -564,6 +565,10 @@ fn convert_face(ctx: &Ctx, face_id: u64, opts: &Options) -> Result<Face, String>
             .map_err(|e| format!("loop {li}: {e}"))?;
         trims.push(uv);
     }
+    // Loops around a periodic surface, and loops unwrapped from the far
+    // side of its seam, take their place from the side the face is on.
+    let reversed: Vec<bool> = as_listed.iter().map(|listed| !listed).collect();
+    project::settle_periodic(&surface, same_sense != flipped, &mut trims, &reversed)?;
     Ok(Face {
         surface,
         trims,
@@ -574,9 +579,11 @@ fn convert_face(ctx: &Ctx, face_id: u64, opts: &Options) -> Result<Face, String>
 /// Lower a STEP surface to the exact `brep_core` vocabulary. Extrusions
 /// of lines and axis-aligned circles become planes and cylinders; other
 /// profiles flatten to a polyline prism at the chord tolerance — the
-/// only approximation in the pipeline.
-fn lower_surface(s: StepSurface, opts: &Options) -> Result<Surface, String> {
-    Ok(match s {
+/// only approximation in the pipeline. The flag says the lowered
+/// surface's normal is the opposite of the STEP surface's.
+fn lower_surface(s: StepSurface, opts: &Options) -> Result<(Surface, bool), String> {
+    let mut flipped = false;
+    let lowered = match s {
         StepSurface::Plane(frame) => Surface::Plane { frame },
         StepSurface::Cylinder(frame, radius) => Surface::Cylinder { frame, radius },
         StepSurface::Cone(frame, radius, half_angle) => Surface::Cone {
@@ -607,6 +614,9 @@ fn lower_surface(s: StepSurface, opts: &Options) -> Result<Surface, String> {
                     }
                 }
                 Curve::Circle { frame, radius } if dot(frame.z, dir_n).abs() > 1.0 - 1e-9 => {
+                    // Swept against the circle's axis, the STEP surface
+                    // faces the axis.
+                    flipped = dot(frame.z, dir_n) < 0.0;
                     Surface::Cylinder { frame, radius }
                 }
                 other => {
@@ -644,7 +654,8 @@ fn lower_surface(s: StepSurface, opts: &Options) -> Result<Surface, String> {
                 }
             }
         }
-    })
+    };
+    Ok((lowered, flipped))
 }
 
 /// Both edge vertices must actually lie on the curve for a sub-arc trim

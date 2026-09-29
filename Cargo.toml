@@ -96,6 +96,8 @@ members = [
     "crates/fea_bundle",
     "crates/fea_solve_cli",
     "crates/brep_core",
+    "crates/brep_build_core",
+    "crates/step_export_core",
     "crates/brep_model_template",
     "crates/trimesh_model_core",
     "crates/trimesh_model_template",

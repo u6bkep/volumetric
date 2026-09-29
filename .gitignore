@@ -12,3 +12,4 @@ target/
 # FEA external-solve bundles (fea-export / fea-solve artifacts)
 *.fea-problem.cbor
 *.fea-solution.cbor
+__pycache__/

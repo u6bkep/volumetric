@@ -1,0 +1,13 @@
+[package]
+name = "step_export_core"
+version = "0.1.0"
+edition = "2024"
+description = "ISO 10303-21 (STEP AP214) writer for brep_core topological solids"
+
+[dependencies]
+brep_core = { path = "../brep_core" }
+
+[dev-dependencies]
+brep_build_core = { path = "../brep_build_core" }
+sketch_regions_core = { path = "../sketch_regions_core" }
+step_import_operator = { path = "../operators/step_import_operator" }

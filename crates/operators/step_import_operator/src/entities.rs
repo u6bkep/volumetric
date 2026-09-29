@@ -569,6 +569,37 @@ impl<'a> Ctx<'a> {
         Ok((surface_id, self.face_bounds(face_id)?))
     }
 
+    /// The sense flags of a face: whether its normal is the surface's
+    /// (`ADVANCED_FACE.same_sense`), and per bound whether the loop runs
+    /// as listed (`FACE_BOUND.orientation`).
+    pub fn face_senses(&self, face_id: u64) -> Result<(bool, Vec<bool>), String> {
+        let r = self.simple(face_id, &["ADVANCED_FACE", "FACE_SURFACE"])?;
+        let same_sense = r
+            .args
+            .get(3)
+            .and_then(Arg::as_bool)
+            .ok_or_else(|| format!("#{face_id}: bad same_sense"))?;
+        let bounds = r
+            .args
+            .get(1)
+            .and_then(Arg::as_list)
+            .ok_or_else(|| format!("#{face_id}: missing bounds list"))?;
+        let mut as_listed = Vec::with_capacity(bounds.len());
+        for b in bounds {
+            let bid = b
+                .as_ref_id()
+                .ok_or_else(|| format!("#{face_id}: bound is not a reference"))?;
+            let br = self.simple(bid, &["FACE_BOUND", "FACE_OUTER_BOUND"])?;
+            as_listed.push(
+                br.args
+                    .get(2)
+                    .and_then(Arg::as_bool)
+                    .ok_or_else(|| format!("#{bid}: bad bound orientation"))?,
+            );
+        }
+        Ok((same_sense, as_listed))
+    }
+
     /// Face ids of a MANIFOLD_SOLID_BREP's shell.
     pub fn solid_faces(&self, msb_id: u64) -> Result<Vec<u64>, String> {
         let r = self.simple(msb_id, &["MANIFOLD_SOLID_BREP"])?;

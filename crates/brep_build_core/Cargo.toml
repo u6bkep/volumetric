@@ -1,0 +1,9 @@
+[package]
+name = "brep_build_core"
+version = "0.1.0"
+edition = "2024"
+description = "Constructors of brep_core topological solids from exact 2D regions"
+
+[dependencies]
+brep_core = { path = "../brep_core" }
+sketch_regions_core = { path = "../sketch_regions_core" }
