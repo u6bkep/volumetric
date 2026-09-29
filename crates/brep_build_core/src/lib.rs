@@ -6,9 +6,11 @@
 //! and every wall is named after the sketch entity it was swept from.
 
 pub mod body;
+pub mod chain;
 pub mod conic;
 pub mod fit;
 pub mod lift;
+pub mod loft;
 pub mod planmap;
 pub mod sheet;
 pub mod trace;

@@ -14,8 +14,9 @@ use brep_core::surface::SurfaceView;
 use brep_core::topo::surface_normal;
 use std::sync::{Arc, OnceLock};
 
-/// A plan point of a surface and its parameters.
-type Seed = ([f64; 2], [f64; 2]);
+/// A plan point of a surface, its parameters, and which way the surface
+/// faces there (the vertical part of `dS/du x dS/dv`).
+type Seed = ([f64; 2], [f64; 2], f64);
 
 #[derive(Clone, Debug)]
 pub struct Sheet {
@@ -75,6 +76,11 @@ impl Sheet {
     /// `(z, u, v)` of every crossing found from the nearest seeds.
     fn crossings(&self, n: &NurbsSurface, x: f64, y: f64) -> Vec<(f64, f64, f64)> {
         let dom = n.domain();
+        // Which way the surface faces: over a plan point a surface that
+        // folds has a crossing on either side of the fold, and the
+        // sheet's is the one facing its way.
+        let facing = |su: Vec3, sv: Vec3| su[0] * sv[1] - su[1] * sv[0];
+        let ours = |f: f64| (f > 0.0) == self.up;
         let seeds = self.seeds.get_or_init(|| {
             // A few points per span of the knots.
             let spans = |knots: &[f64]| knots.windows(2).filter(|k| k[1] > k[0]).count();
@@ -85,15 +91,18 @@ impl Sheet {
                 for j in 0..=nv {
                     let u = dom[0] + (dom[1] - dom[0]) * i as f64 / nu as f64;
                     let v = dom[2] + (dom[3] - dom[2]) * j as f64 / nv as f64;
-                    let p = surface_eval(n, u, v).0;
-                    seeds.push(([p[0], p[1]], [u, v]));
+                    let (p, su, sv) = surface_eval(n, u, v);
+                    seeds.push(([p[0], p[1]], [u, v], facing(su, sv)));
                 }
             }
             seeds
         });
         const STARTS: usize = 8;
         let mut nearest: [(f64, usize); STARTS] = [(f64::INFINITY, 0); STARTS];
-        for (k, (p, _)) in seeds.iter().enumerate() {
+        for (k, (p, _, f)) in seeds.iter().enumerate() {
+            if !ours(*f) {
+                continue;
+            }
             let d = (p[0] - x).powi(2) + (p[1] - y).powi(2);
             if d < nearest[STARTS - 1].0 {
                 let at = nearest.iter().position(|e| d < e.0).unwrap();
@@ -109,7 +118,7 @@ impl Sheet {
             }
             let [mut u, mut v] = seeds[k].1;
             let mut found = false;
-            for step in 0..32 {
+            for step in 0..48 {
                 let (p, su, sv) = surface_eval(n, u, v);
                 let (rx, ry) = (x - p[0], y - p[1]);
                 // On the surface, or at its edge with the point just
@@ -119,12 +128,34 @@ impl Sheet {
                     found = true;
                     break;
                 }
-                let det = su[0] * sv[1] - su[1] * sv[0];
+                let det = facing(su, sv);
                 if det == 0.0 || !det.is_finite() {
                     break;
                 }
-                u = (u + (rx * sv[1] - ry * sv[0]) / det).clamp(dom[0], dom[1]);
-                v = (v + (su[0] * ry - su[1] * rx) / det).clamp(dom[2], dom[3]);
+                let (mu, mv) = (
+                    (rx * sv[1] - ry * sv[0]) / det,
+                    (su[0] * ry - su[1] * rx) / det,
+                );
+                // The whole step, or as much of it as stays on the
+                // sheet's side of the fold.
+                let mut part = 1.0;
+                let mut moved = false;
+                for _ in 0..12 {
+                    let (nu, nv) = (
+                        (u + part * mu).clamp(dom[0], dom[1]),
+                        (v + part * mv).clamp(dom[2], dom[3]),
+                    );
+                    let (_, su, sv) = surface_eval(n, nu, nv);
+                    if ours(facing(su, sv)) {
+                        (u, v) = (nu, nv);
+                        moved = true;
+                        break;
+                    }
+                    part *= 0.5;
+                }
+                if !moved {
+                    break;
+                }
             }
             if !found {
                 continue;

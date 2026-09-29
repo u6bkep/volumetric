@@ -13,9 +13,10 @@
 //! Within one face of that division the column through the body enters
 //! and leaves by the same two faces, which a point inside it tells.
 
+use crate::chain::Span;
 use crate::planmap::{Cell, PlanMap, Tolerances, cells_of};
 use crate::sheet::Sheet;
-use crate::trace::FREE;
+use crate::trace::{FREE, pieces_of, trace_zero};
 use brep_core::ir::{NurbsSurface, Surface};
 use brep_core::math::{Frame, Vec3, add, cross, dot, norm, normalize, scale, sub};
 use core::f64::consts::{FRAC_PI_2, PI, TAU};
@@ -116,6 +117,372 @@ fn swept_arc(s: &Sweep, c: P2, r: f64, a0: f64, turn: f64, w: (f64, f64)) -> Nur
     }
 }
 
+/// The shadow on the plan of a curve of a plane whose axes have the
+/// shadows `ux` and `vx`, `to_plan` taking the plane's points to the
+/// plan: a line's is a line, an arc's an arc (the plane level), a line
+/// (the plane upright, seen edge on) or an ellipse, which comes as short
+/// lines under a [`FREE`] id.
+fn shadow(
+    curve: &Curve,
+    to_plan: &dyn Fn(P2) -> P2,
+    ux: P2,
+    vx: P2,
+    id: &str,
+    tol: &Tolerances,
+) -> Vec<(String, Curve)> {
+    let det = ux[0] * vx[1] - ux[1] * vx[0];
+    let rigid = (ux[0] * ux[0] + ux[1] * ux[1] - 1.0).abs() < 1e-12
+        && (vx[0] * vx[0] + vx[1] * vx[1] - 1.0).abs() < 1e-12
+        && (ux[0] * vx[0] + ux[1] * vx[1]).abs() < 1e-12;
+    match *curve {
+        Curve::Line { a, b } => vec![(
+            id.to_string(),
+            Curve::Line {
+                a: to_plan(a),
+                b: to_plan(b),
+            },
+        )],
+        Curve::Arc { c, r, sweep, .. } => {
+            if rigid {
+                let full = sweep.abs() >= TAU - 1e-9;
+                let arc = if full {
+                    Curve::circle(to_plan(c), r)
+                } else {
+                    Curve::arc_from_ends(
+                        to_plan(c),
+                        to_plan(curve.start()),
+                        to_plan(curve.end()),
+                        (sweep > 0.0) == (det > 0.0),
+                    )
+                };
+                vec![(id.to_string(), arc)]
+            } else if det.abs() < 1e-12 {
+                // Seen edge on: the stretch of the plane's trace the arc
+                // covers.
+                let trace = if ux[0].hypot(ux[1]) > vx[0].hypot(vx[1]) {
+                    ux
+                } else {
+                    vx
+                };
+                let along = |q: P2| {
+                    let f = to_plan(q);
+                    f[0] * trace[0] + f[1] * trace[1]
+                };
+                let (al, be) = (
+                    r * (ux[0] * trace[0] + ux[1] * trace[1]),
+                    r * (vx[0] * trace[0] + vx[1] * trace[1]),
+                );
+                let mut stops = vec![curve.start(), curve.end()];
+                for th in [be.atan2(al), be.atan2(al) + PI] {
+                    if let Some(t) = curve.arc_param(th, 0.0) {
+                        stops.push(curve.point(t));
+                    }
+                }
+                stops.sort_by(|x, y| along(*x).total_cmp(&along(*y)));
+                vec![(
+                    id.to_string(),
+                    Curve::Line {
+                        a: to_plan(stops[0]),
+                        b: to_plan(stops[stops.len() - 1]),
+                    },
+                )]
+            } else {
+                // An ellipse in the plan.
+                let step = 2.0 * (1.0 - (tol.chord / r).min(0.5)).acos();
+                let n = ((sweep.abs() / step).ceil() as usize).max(8);
+                (0..n)
+                    .map(|i| {
+                        let (t0, t1) = (i as f64 / n as f64, (i + 1) as f64 / n as f64);
+                        (
+                            format!("{FREE}{id}"),
+                            Curve::Line {
+                                a: to_plan(curve.point(t0)),
+                                b: to_plan(curve.point(t1)),
+                            },
+                        )
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// A face of a body given by its faces.
+#[derive(Clone, Debug)]
+pub enum FaceSpec {
+    /// A region of the plane `origin + a u + b v`.
+    Flat {
+        region: Region,
+        origin: Vec3,
+        u: Vec3,
+        v: Vec3,
+        name: String,
+    },
+    /// A whole patch of surface. `edges` are the curves around it where
+    /// they are known better than the surface has them (a fitted patch
+    /// follows its edges to a tolerance, and its neighbour follows the
+    /// same edge to the same tolerance elsewhere); without any, the
+    /// patch's own four edges are taken.
+    Patch {
+        surface: NurbsSurface,
+        name: String,
+        edges: Vec<Span>,
+    },
+}
+
+/// The body enclosed by `faces`, as far as a plan map holds it: over
+/// every plan point the column from the lowest of the faces to the
+/// highest.
+///
+/// The plan is divided by the shadows of the faces' boundaries and, on a
+/// patch, of the curves where it turns vertical.
+pub fn envelope(faces: &[FaceSpec], tol: &Tolerances) -> Result<PlanMap, String> {
+    let flat = |p: Vec3| -> P2 { [p[0], p[1]] };
+    let mut plan: Vec<Piece> = Vec::new();
+    let mut push = |id: String, curve: Curve| {
+        if curve.length() > tol.snap {
+            plan.push(Piece { id, curve });
+        }
+    };
+    // Both halves of every patch, the plane of every flat face.
+    let mut sheets: Vec<Vec<Sheet>> = Vec::with_capacity(faces.len());
+    for face in faces {
+        match face {
+            FaceSpec::Flat {
+                region,
+                origin,
+                u,
+                v,
+                name,
+            } => {
+                let to_plan = |q: P2| flat(add(*origin, add(scale(*u, q[0]), scale(*v, q[1]))));
+                for p in region.pieces() {
+                    let id = format!("{name}:{}", p.id);
+                    for (id, curve) in shadow(&p.curve, &to_plan, flat(*u), flat(*v), &id, tol) {
+                        push(id, curve);
+                    }
+                }
+                let n = normalize(cross(*u, *v));
+                sheets.push(if n[2].abs() < 1e-9 {
+                    Vec::new()
+                } else {
+                    let n = if n[2] > 0.0 { n } else { scale(n, -1.0) };
+                    vec![Sheet::of(
+                        Surface::Plane {
+                            frame: Frame::from_axis_ref(*origin, n, *u),
+                        },
+                        true,
+                        name,
+                    )]
+                });
+            }
+            FaceSpec::Patch {
+                surface,
+                name,
+                edges,
+            } => {
+                surface.validate()?;
+                let dom = surface.domain();
+                let at = |u: f64, v: f64| flat(brep_core::nurbs::surface_eval(surface, u, v).0);
+                let mut edge = |curve: &dyn Fn(f64) -> P2, which: &str| {
+                    for line in polyline(curve, tol.chord) {
+                        for p in pieces_of(&line, &format!("{name}:{which}"), tol.exact, [0.0; 2]) {
+                            push(p.id, p.curve);
+                        }
+                    }
+                };
+                if edges.is_empty() {
+                    edge(&|t| at(dom[0] + t * (dom[1] - dom[0]), dom[2]), "v0");
+                    edge(&|t| at(dom[0] + t * (dom[1] - dom[0]), dom[3]), "v1");
+                    edge(&|t| at(dom[0], dom[2] + t * (dom[3] - dom[2])), "u0");
+                    edge(&|t| at(dom[1], dom[2] + t * (dom[3] - dom[2])), "u1");
+                }
+                for (k, span) in edges.iter().enumerate() {
+                    let len = span.len();
+                    if len > tol.snap {
+                        edge(&|t| flat(span.at(t * len)), &format!("edge{k}"));
+                    }
+                }
+                // Where it turns vertical: the level normal, followed in
+                // the patch's own parameters brought to the unit square.
+                let (du, dv) = (dom[1] - dom[0], dom[3] - dom[2]);
+                let own = |q: P2| (dom[0] + q[0] * du, dom[2] + q[1] * dv);
+                let level = |q: P2| -> Option<f64> {
+                    if q[0] < 0.0 || q[0] > 1.0 || q[1] < 0.0 || q[1] > 1.0 {
+                        return None;
+                    }
+                    let (u, v) = own(q);
+                    let (_, su, sv) = brep_core::nurbs::surface_eval(surface, u, v);
+                    let n = cross(su, sv);
+                    let len = norm(n);
+                    (len > 0.0).then(|| n[2] / len)
+                };
+                // A chord of the curve in the plan is about as long as
+                // the patch is wide times its length in parameters.
+                let size = {
+                    let (a, b, c) = (at(dom[0], dom[2]), at(dom[1], dom[2]), at(dom[0], dom[3]));
+                    ((b[0] - a[0]).hypot(b[1] - a[1]))
+                        .max((c[0] - a[0]).hypot(c[1] - a[1]))
+                        .max(1e-6)
+                };
+                let rims = trace_zero(&level, [0.0, 0.0, 1.0, 1.0], 1.0 / 48.0, tol.chord / size);
+                for (k, rim) in rims.iter().enumerate() {
+                    let line: Vec<P2> = rim
+                        .iter()
+                        .map(|q| {
+                            let (u, v) = own(*q);
+                            at(u, v)
+                        })
+                        .collect();
+                    for p in pieces_of(&line, &format!("{name}:rim{k}"), tol.exact, [0.0; 2]) {
+                        push(p.id, p.curve);
+                    }
+                }
+                sheets.push(
+                    [true, false]
+                        .into_iter()
+                        .map(|up| Sheet::of(Surface::Nurbs(surface.clone()), up, name))
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    let mut map = PlanMap::new();
+    map.tol = *tol;
+    let mut made: HashMap<(usize, usize), usize> = HashMap::new();
+    let cells: Vec<Cell> = cells_of(&plan, tol.snap, &mut |p| {
+        // Every face the column meets.
+        let mut lo: Option<(f64, usize, usize)> = None;
+        let mut hi: Option<(f64, usize, usize)> = None;
+        let mut met = 0;
+        for (f, (face, halves)) in faces.iter().zip(&sheets).enumerate() {
+            for (h, sheet) in halves.iter().enumerate() {
+                let Some(z) = sheet.z_open(p[0], p[1]) else {
+                    continue;
+                };
+                if let FaceSpec::Flat {
+                    region,
+                    origin,
+                    u,
+                    v,
+                    ..
+                } = face
+                {
+                    let d = sub([p[0], p[1], z], *origin);
+                    if !region.contains([dot(d, *u), dot(d, *v)]) {
+                        continue;
+                    }
+                }
+                met += 1;
+                if lo.is_none_or(|l| z < l.0) {
+                    lo = Some((z, f, h));
+                }
+                if hi.is_none_or(|l| z > l.0) {
+                    hi = Some((z, f, h));
+                }
+            }
+        }
+        let (Some(lo), Some(hi)) = (lo, hi) else {
+            return Ok(None);
+        };
+        if met < 2 || hi.0 - lo.0 <= tol.height {
+            return Ok(None);
+        }
+        let mut sheet = |(_, f, h): (f64, usize, usize)| {
+            *made.entry((f, h)).or_insert_with(|| {
+                map.sheets.push(sheets[f][h].clone());
+                map.sheets.len() - 1
+            })
+        };
+        Ok(Some((sheet(hi), sheet(lo))))
+    })?;
+    if cells.is_empty() {
+        return Err("the faces enclose nothing the plan can hold".into());
+    }
+    map.cells = cells;
+    Ok(map)
+}
+
+/// Points of a curve over `[0, 1]` whose chords stay within `tol` of it,
+/// in runs that do not turn back on themselves: the shadow of a curve
+/// seen edge on goes out and back along one line, and turns at a point
+/// of its own.
+fn polyline(curve: &dyn Fn(f64) -> P2, tol: f64) -> Vec<Vec<P2>> {
+    // Halved until the middle of each part is on its chord, and between
+    // the chord's ends (a curve can swing back onto its chord).
+    fn halve(
+        curve: &dyn Fn(f64) -> P2,
+        tol: f64,
+        from: (f64, P2),
+        to: (f64, P2),
+        depth: usize,
+        out: &mut Vec<(f64, P2)>,
+    ) {
+        let mid = 0.5 * (from.0 + to.0);
+        let q = curve(mid);
+        let chord = [to.1[0] - from.1[0], to.1[1] - from.1[1]];
+        let len = chord[0].hypot(chord[1]);
+        let (off, along) = if len > 0.0 {
+            let d = [q[0] - from.1[0], q[1] - from.1[1]];
+            (
+                (d[0] * chord[1] - d[1] * chord[0]).abs() / len,
+                (d[0] * chord[0] + d[1] * chord[1]) / (len * len),
+            )
+        } else {
+            ((q[0] - from.1[0]).hypot(q[1] - from.1[1]), 0.5)
+        };
+        if (off > tol || !(0.2..=0.8).contains(&along)) && depth < 20 {
+            halve(curve, tol, from, (mid, q), depth + 1, out);
+            halve(curve, tol, (mid, q), to, depth + 1, out);
+        } else {
+            out.push(to);
+        }
+    }
+    let mut out: Vec<(f64, P2)> = vec![(0.0, curve(0.0))];
+    for k in 1..=16 {
+        let from = *out.last().unwrap();
+        let t = k as f64 / 16.0;
+        halve(curve, tol, from, (t, curve(t)), 0, &mut out);
+    }
+    // Turns: where a chord runs against the one before. The point of
+    // the turn is the furthest the curve gets along the way in.
+    let mut runs: Vec<Vec<P2>> = vec![vec![out[0].1]];
+    for i in 1..out.len() {
+        let (t, p) = out[i];
+        let turned = i + 1 < out.len() && {
+            let (a, b) = (out[i - 1].1, out[i + 1].1);
+            (p[0] - a[0]) * (b[0] - p[0]) + (p[1] - a[1]) * (b[1] - p[1]) < 0.0
+        };
+        if !turned {
+            runs.last_mut().unwrap().push(p);
+            continue;
+        }
+        let from = out[i - 1].1;
+        let way = [p[0] - from[0], p[1] - from[1]];
+        let reach = |t: f64| {
+            let q = curve(t);
+            (q[0] - from[0]) * way[0] + (q[1] - from[1]) * way[1]
+        };
+        const G: f64 = 0.618_033_988_749_894_9;
+        let (mut lo, mut hi) = (out[i - 1].0, out[i + 1].0);
+        for _ in 0..64 {
+            let (a, b) = (hi - G * (hi - lo), lo + G * (hi - lo));
+            if reach(a) > reach(b) {
+                hi = b;
+            } else {
+                lo = a;
+            }
+        }
+        let _ = t;
+        let turn = curve(0.5 * (lo + hi));
+        runs.last_mut().unwrap().push(turn);
+        runs.push(vec![turn]);
+    }
+    runs.retain(|r| r.len() >= 2);
+    runs
+}
+
 /// The body of a sweep.
 pub fn sweep(s: &Sweep, tol: &Tolerances) -> Result<PlanMap, String> {
     let normal = normalize(cross(s.u, s.v));
@@ -203,11 +570,6 @@ pub fn sweep(s: &Sweep, tol: &Tolerances) -> Result<PlanMap, String> {
             plan.push(Piece { id, curve });
         }
     };
-    let (ux, vx) = (flat(s.u), flat(s.v));
-    let det = ux[0] * vx[1] - ux[1] * vx[0];
-    let rigid = (ux[0] * ux[0] + ux[1] * ux[1] - 1.0).abs() < 1e-12
-        && (vx[0] * vx[0] + vx[1] * vx[1] - 1.0).abs() < 1e-12
-        && (ux[0] * vx[0] + ux[1] * vx[1]).abs() < 1e-12;
     for (w, end) in [(w0, "start"), (w1, "end")] {
         for p in &pieces {
             // A piece of an upright sweep is its wall; elsewhere it is
@@ -217,76 +579,15 @@ pub fn sweep(s: &Sweep, tol: &Tolerances) -> Result<PlanMap, String> {
             } else {
                 named(&format!("{end}:{}", p.id))
             };
-            let shadow = |q: P2| flat(point(q, w));
-            match p.curve {
-                Curve::Line { a, b } => push(
-                    id,
-                    Curve::Line {
-                        a: shadow(a),
-                        b: shadow(b),
-                    },
-                ),
-                Curve::Arc { c, r, a0, sweep } => {
-                    if rigid {
-                        let full = sweep.abs() >= TAU - 1e-9;
-                        let curve = if full {
-                            Curve::circle(shadow(c), r)
-                        } else {
-                            Curve::arc_from_ends(
-                                shadow(c),
-                                shadow(p.curve.start()),
-                                shadow(p.curve.end()),
-                                (sweep > 0.0) == (det > 0.0),
-                            )
-                        };
-                        push(id, curve);
-                    } else if det.abs() < 1e-12 {
-                        // Seen edge on: the stretch of the plane's trace
-                        // the arc covers.
-                        let trace = if norm([ux[0], ux[1], 0.0]) > norm([vx[0], vx[1], 0.0]) {
-                            ux
-                        } else {
-                            vx
-                        };
-                        let along = |q: P2| {
-                            let f = shadow(q);
-                            f[0] * trace[0] + f[1] * trace[1]
-                        };
-                        let (al, be) = (
-                            r * (ux[0] * trace[0] + ux[1] * trace[1]),
-                            r * (vx[0] * trace[0] + vx[1] * trace[1]),
-                        );
-                        let mut stops = vec![p.curve.start(), p.curve.end()];
-                        for th in [be.atan2(al), be.atan2(al) + PI] {
-                            if let Some(t) = p.curve.arc_param(th, 0.0) {
-                                stops.push(p.curve.point(t));
-                            }
-                        }
-                        stops.sort_by(|x, y| along(*x).total_cmp(&along(*y)));
-                        push(
-                            id,
-                            Curve::Line {
-                                a: shadow(stops[0]),
-                                b: shadow(stops[stops.len() - 1]),
-                            },
-                        );
-                    } else {
-                        // An ellipse in the plan.
-                        let step = 2.0 * (1.0 - (tol.chord / r).min(0.5)).acos();
-                        let n = ((sweep.abs() / step).ceil() as usize).max(8);
-                        for i in 0..n {
-                            let (t0, t1) = (i as f64 / n as f64, (i + 1) as f64 / n as f64);
-                            push(
-                                format!("{FREE}{id}"),
-                                Curve::Line {
-                                    a: shadow(p.curve.point(t0)),
-                                    b: shadow(p.curve.point(t1)),
-                                },
-                            );
-                        }
-                        let _ = (a0, c);
-                    }
-                }
+            for (id, curve) in shadow(
+                &p.curve,
+                &|q| flat(point(q, w)),
+                flat(s.u),
+                flat(s.v),
+                &id,
+                tol,
+            ) {
+                push(id, curve);
             }
         }
     }

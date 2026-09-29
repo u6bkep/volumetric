@@ -271,3 +271,227 @@ mod tests {
         assert!(deviation(&c, &f, 16) < 1e-8);
     }
 }
+
+/// A bicubic B-spline surface over `[u0, u1] x [v0, v1]` within `tol` of
+/// `f`, which must be smooth there and a little beyond (its derivatives
+/// are taken by differences across the nodes, the edges included, two
+/// thousandths of the range out).
+///
+/// Piecewise bicubic Hermite on a grid of nodes that is halved, in the
+/// direction the error is worse in, wherever the patch strays.
+pub fn fit_surface(
+    f: &dyn Fn(f64, f64) -> Vec3,
+    u: (f64, f64),
+    v: (f64, f64),
+    tol: f64,
+) -> brep_core::ir::NurbsSurface {
+    let (hu, hv) = (1e-3 * (u.1 - u.0), 1e-3 * (v.1 - v.0));
+    // Value, d/du, d/dv and d2/dudv at a node, by differences of fourth
+    // order (exact on the cubics the patch is made of).
+    const STENCIL: [(f64, f64); 4] = [
+        (-2.0, 1.0 / 12.0),
+        (-1.0, -8.0 / 12.0),
+        (1.0, 8.0 / 12.0),
+        (2.0, -1.0 / 12.0),
+    ];
+    let node = |a: f64, b: f64| -> [Vec3; 4] {
+        let mut out = [f(a, b), [0.0; 3], [0.0; 3], [0.0; 3]];
+        for (i, wi) in STENCIL {
+            out[1] = add(out[1], scale(f(a + i * hu, b), wi / hu));
+            out[2] = add(out[2], scale(f(a, b + i * hv), wi / hv));
+            for (j, wj) in STENCIL {
+                out[3] = add(
+                    out[3],
+                    scale(f(a + i * hu, b + j * hv), wi * wj / (hu * hv)),
+                );
+            }
+        }
+        out
+    };
+    // One direction of Hermite: values and derivatives at the ends.
+    let h1 = |p0: Vec3, d0: Vec3, p1: Vec3, d1: Vec3, h: f64, s: f64| hermite(p0, d0, p1, d1, h, s);
+    let mut us = vec![u.0, u.1];
+    let mut vs = vec![v.0, v.1];
+    let mut grid: Vec<Vec<[Vec3; 4]>>;
+    for _ in 0..12 {
+        grid = us
+            .iter()
+            .map(|&a| vs.iter().map(|&b| node(a, b)).collect())
+            .collect();
+        let at = |i: usize, j: usize, s: f64, t: f64| -> Vec3 {
+            let (du, dv) = (us[i + 1] - us[i], vs[j + 1] - vs[j]);
+            // Along v at both u ends, for the value and for d/du.
+            let (n00, n01, n10, n11) = (
+                grid[i][j],
+                grid[i][j + 1],
+                grid[i + 1][j],
+                grid[i + 1][j + 1],
+            );
+            let p0 = h1(n00[0], n00[2], n01[0], n01[2], dv, t);
+            let p1 = h1(n10[0], n10[2], n11[0], n11[2], dv, t);
+            let d0 = h1(n00[1], n00[3], n01[1], n01[3], dv, t);
+            let d1 = h1(n10[1], n10[3], n11[1], n11[3], dv, t);
+            h1(p0, d0, p1, d1, du, s)
+        };
+        let mut split_u = vec![false; us.len() - 1];
+        let mut split_v = vec![false; vs.len() - 1];
+        for i in 0..us.len() - 1 {
+            for j in 0..vs.len() - 1 {
+                let err = |s: f64, t: f64| {
+                    let q = f(
+                        us[i] + s * (us[i + 1] - us[i]),
+                        vs[j] + t * (vs[j + 1] - vs[j]),
+                    );
+                    norm(sub(at(i, j, s, t), q))
+                };
+                let across_u = err(0.5, 0.0)
+                    .max(err(0.5, 1.0))
+                    .max(err(0.25, 0.5))
+                    .max(err(0.75, 0.5));
+                let across_v = err(0.0, 0.5)
+                    .max(err(1.0, 0.5))
+                    .max(err(0.5, 0.25))
+                    .max(err(0.5, 0.75));
+                let middle = err(0.5, 0.5);
+                if across_u.max(across_v).max(middle) <= tol {
+                    continue;
+                }
+                if across_u >= across_v || middle > tol {
+                    split_u[i] = true;
+                }
+                if across_v > across_u || middle > tol {
+                    split_v[j] = true;
+                }
+            }
+        }
+        if !split_u.contains(&true) && !split_v.contains(&true) {
+            break;
+        }
+        let halve = |xs: &[f64], split: &[bool]| -> Vec<f64> {
+            let mut out = vec![xs[0]];
+            for (k, w) in xs.windows(2).enumerate() {
+                if split[k] {
+                    out.push(0.5 * (w[0] + w[1]));
+                }
+                out.push(w[1]);
+            }
+            out
+        };
+        us = halve(&us, &split_u);
+        vs = halve(&vs, &split_v);
+    }
+    let grid: Vec<Vec<[Vec3; 4]>> = us
+        .iter()
+        .map(|&a| vs.iter().map(|&b| node(a, b)).collect())
+        .collect();
+
+    // To control points: first along u (values and d/dv alike), then
+    // along v.
+    let along = |xs: &[f64], p: &[Vec3], d: &[Vec3]| -> Vec<Vec3> {
+        let n = xs.len() - 1;
+        let mut out = Vec::with_capacity(2 * n + 2);
+        for i in 0..=n {
+            if i > 0 {
+                out.push(sub(p[i], scale(d[i], (xs[i] - xs[i - 1]) / 3.0)));
+            }
+            if i == 0 || i == n {
+                out.push(p[i]);
+            }
+            if i < n {
+                out.push(add(p[i], scale(d[i], (xs[i + 1] - xs[i]) / 3.0)));
+            }
+        }
+        out
+    };
+    let knots = |xs: &[f64]| -> Vec<f64> {
+        let n = xs.len() - 1;
+        let mut k = vec![xs[0]; 4];
+        for x in &xs[1..n] {
+            k.extend([*x; 2]);
+        }
+        k.extend([xs[n]; 4]);
+        k
+    };
+    let (nu, nv) = (2 * us.len(), 2 * vs.len());
+    // Per v node: control points along u of the value and of d/dv.
+    let mut rows: Vec<(Vec<Vec3>, Vec<Vec3>)> = Vec::with_capacity(vs.len());
+    for j in 0..vs.len() {
+        let pick = |k: usize| -> Vec<Vec3> { (0..us.len()).map(|i| grid[i][j][k]).collect() };
+        rows.push((
+            along(&us, &pick(0), &pick(1)),
+            along(&us, &pick(2), &pick(3)),
+        ));
+    }
+    let mut ctrl = vec![[0.0; 4]; nu * nv];
+    for i in 0..nu {
+        let p: Vec<Vec3> = rows.iter().map(|r| r.0[i]).collect();
+        let d: Vec<Vec3> = rows.iter().map(|r| r.1[i]).collect();
+        for (j, c) in along(&vs, &p, &d).into_iter().enumerate() {
+            ctrl[i * nv + j] = [c[0], c[1], c[2], 1.0];
+        }
+    }
+    brep_core::ir::NurbsSurface {
+        degree_u: 3,
+        degree_v: 3,
+        nctrl_u: nu,
+        nctrl_v: nv,
+        knots_u: knots(&us),
+        knots_v: knots(&vs),
+        ctrl,
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+    use brep_core::nurbs::surface_eval;
+
+    fn worst(
+        s: &brep_core::ir::NurbsSurface,
+        f: &dyn Fn(f64, f64) -> Vec3,
+        u: (f64, f64),
+        v: (f64, f64),
+    ) -> f64 {
+        let mut w = 0.0f64;
+        for i in 0..=60 {
+            for j in 0..=60 {
+                let (a, b) = (
+                    u.0 + (u.1 - u.0) * i as f64 / 60.0,
+                    v.0 + (v.1 - v.0) * j as f64 / 60.0,
+                );
+                w = w.max(norm(sub(surface_eval(s, a, b).0, f(a, b))));
+            }
+        }
+        w
+    }
+
+    #[test]
+    fn a_bicubic_is_its_own_fit() {
+        let f = |u: f64, v: f64| [u, v, u * u * u - 2.0 * u * v * v + 0.5 * v * v * v * u];
+        let s = fit_surface(&f, (0.0, 1.0), (-1.0, 2.0), 1e-9);
+        s.validate().unwrap();
+        assert_eq!((s.nctrl_u, s.nctrl_v), (4, 4));
+        assert!(worst(&s, &f, (0.0, 1.0), (-1.0, 2.0)) < 1e-9);
+    }
+
+    #[test]
+    fn a_blend_of_arcs() {
+        // Between a quarter circle of radius 50 mm and one of 80 mm, 30 mm
+        // higher and turned.
+        let f = |u: f64, v: f64| {
+            let a = [0.05 * u.cos(), 0.05 * u.sin(), 0.0];
+            let b = [0.08 * (u + 0.3).cos(), 0.08 * (u + 0.3).sin(), 0.03];
+            let bulge = 0.01 * (core::f64::consts::PI * v).sin();
+            [
+                a[0] + v * (b[0] - a[0]) + bulge * u.cos(),
+                a[1] + v * (b[1] - a[1]) + bulge * u.sin(),
+                a[2] + v * (b[2] - a[2]),
+            ]
+        };
+        let s = fit_surface(&f, (0.0, 1.5), (0.0, 1.0), 5e-8);
+        s.validate().unwrap();
+        let w = worst(&s, &f, (0.0, 1.5), (0.0, 1.0));
+        assert!(w < 1e-7, "{w}");
+        assert!(s.ctrl.len() < 3000, "{} control points", s.ctrl.len());
+    }
+}
