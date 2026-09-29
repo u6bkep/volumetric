@@ -20,6 +20,7 @@
 
 use crate::sheet::Sheet;
 use crate::trace::{pieces_of, trace_zero};
+use brep_core::math::Vec3;
 use sketch_regions_core::geom::{add, scale};
 use sketch_regions_core::{Curve, P2, Piece, Region, arrange, arrangement};
 
@@ -95,6 +96,34 @@ fn bbox_overlap(a: [f64; 4], b: [f64; 4], pad: f64) -> Option<[f64; 4]> {
     (r[0] < r[2] && r[1] < r[3]).then_some(r)
 }
 
+/// The parts of `pieces` inside both regions: a crease is where two
+/// sheets cross, but it divides a cell only where both are the column's.
+fn clip(pieces: Vec<Piece>, a: &Region, b: &Region, snap: f64) -> Vec<Piece> {
+    let mut out = Vec::new();
+    for piece in pieces {
+        let mut stops = vec![0.0, 1.0];
+        for edge in a.pieces().chain(b.pieces()) {
+            for (t, _) in sketch_regions_core::geom::intersect(&piece.curve, &edge.curve, snap) {
+                stops.push(t);
+            }
+        }
+        stops.sort_by(|x, y| x.total_cmp(y));
+        let len = piece.curve.length();
+        stops.dedup_by(|x, y| (*x - *y).abs() * len <= snap);
+        for w in stops.windows(2) {
+            let part = piece.curve.sub(w[0], w[1]);
+            let mid = part.point(0.5);
+            if part.length() > snap && a.contains(mid) && b.contains(mid) {
+                out.push(Piece {
+                    id: piece.id.clone(),
+                    curve: part,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// A point of the region as far from its boundary as a handful of tries
 /// find: the place to ask what the region is.
 pub fn deep_point(region: &Region) -> Option<P2> {
@@ -120,6 +149,49 @@ pub fn deep_point(region: &Region) -> Option<P2> {
         }
     }
     best.map(|(p, _)| p).or_else(|| region.interior_point())
+}
+
+/// The cells of an arrangement: `column` says what `(top, bot)` stands
+/// over a point, the faces of the arrangement of `pieces` are asked at a
+/// point inside each, and faces with the same answer on both sides of an
+/// edge are one cell.
+pub fn cells_of(
+    pieces: &[Piece],
+    snap: f64,
+    column: &mut dyn FnMut(P2) -> Result<Option<(usize, usize)>, String>,
+) -> Result<Vec<Cell>, String> {
+    let arr = arrangement(pieces, snap);
+    let mut labels: Vec<Option<(usize, usize)>> = Vec::with_capacity(arr.faces.len());
+    for face in &arr.faces {
+        labels.push(match deep_point(face) {
+            Some(p) => column(p)?,
+            None => None,
+        });
+    }
+    let label = |f: Option<usize>| f.and_then(|f| labels[f]);
+    let boundary: Vec<Piece> = arr
+        .edges
+        .iter()
+        .filter(|e| label(e.left) != label(e.right))
+        .map(|e| Piece {
+            id: e.id.clone(),
+            curve: e.curve,
+        })
+        .collect();
+    let face_boxes: Vec<[f64; 4]> = arr.faces.iter().map(|f| f.bbox()).collect();
+    let mut cells = Vec::new();
+    for region in arrange(&boundary, snap) {
+        let Some(p) = deep_point(&region) else {
+            continue;
+        };
+        let face = arr.faces.iter().zip(&face_boxes).position(|(f, b)| {
+            p[0] >= b[0] && p[0] <= b[2] && p[1] >= b[1] && p[1] <= b[3] && f.contains(p)
+        });
+        if let Some((top, bot)) = label(face) {
+            cells.push(Cell { region, top, bot });
+        }
+    }
+    Ok(cells)
 }
 
 impl PlanMap {
@@ -239,12 +311,66 @@ impl PlanMap {
                 },
             }];
         }
-        let g = |p: P2| Some(sa.z(p[0], p[1])? - sb.z(p[0], p[1])?);
-        let lines = trace_zero(&g, rect, self.tol.pitch, self.tol.chord);
+        let g = |p: P2| Some(sa.z_open(p[0], p[1])? - sb.z_open(p[0], p[1])?);
+        let mut lines = trace_zero(&g, rect, self.tol.pitch, self.tol.chord);
+        // A crease that runs out where one sheet turns vertical touches
+        // that sheet's rim, at the point of the rim as high as the other
+        // sheet. It ends there exactly, as does the crease with the
+        // sheet's other half.
+        let pin = |end: P2| -> Option<P2> {
+            let reach = 4.0 * self.tol.pitch;
+            [(sa, sb), (sb, sa)]
+                .into_iter()
+                .find_map(|(folded, other)| {
+                    let (mut on, mut n) = folded.rim_near(end[0], end[1], reach)?;
+                    let miss = |on: Vec3| Some(other.z(on[0], on[1])? - on[2]);
+                    let mut h = miss(on)?;
+                    let mut step = 1e-5;
+                    for _ in 0..40 {
+                        if h.abs() < 1e-11 {
+                            break;
+                        }
+                        // Along the rim: across its level normal.
+                        let len = n[0].hypot(n[1]);
+                        let along = [-n[1] / len, n[0] / len];
+                        let (next, next_n) = folded.rim_near(
+                            on[0] + step * along[0],
+                            on[1] + step * along[1],
+                            reach,
+                        )?;
+                        let h1 = miss(next)?;
+                        if h1 == h {
+                            return None;
+                        }
+                        // The secant's next step, from the new point.
+                        let moved = (next[0] - on[0]) * along[0] + (next[1] - on[1]) * along[1];
+                        step = -h1 * moved / (h1 - h);
+                        (on, n, h) = (next, next_n, h1);
+                        if step.abs() > reach {
+                            return None;
+                        }
+                    }
+                    let at = [on[0], on[1]];
+                    (h.abs() < 1e-9 && sketch_regions_core::geom::dist(at, end) <= reach)
+                        .then_some(at)
+                })
+        };
         let mut out = Vec::new();
-        for line in &lines {
+        for line in lines.iter_mut() {
+            let n = line.len();
+            let closed =
+                n > 3 && sketch_regions_core::geom::dist(line[0], line[n - 1]) <= self.tol.exact;
+            let mut beyond = [20.0 * self.tol.snap; 2];
+            if !closed {
+                for (k, slot) in [(0, 0), (n - 1, 1)] {
+                    if let Some(at) = pin(line[k]) {
+                        line[k] = at;
+                        beyond[slot] = 0.0;
+                    }
+                }
+            }
             *traced += 1;
-            out.extend(pieces_of(line, &name(*traced), self.tol.exact));
+            out.extend(pieces_of(line, &name(*traced), self.tol.exact, beyond));
         }
         out
     }
@@ -352,7 +478,12 @@ impl PlanMap {
                     ],
                 };
                 for &(a, b) in pairs {
-                    let found = self.creases(a, b, rect, &mut traced);
+                    let found = clip(
+                        self.creases(a, b, rect, &mut traced),
+                        &s.region,
+                        &t.region,
+                        self.tol.snap,
+                    );
                     report.creases += usize::from(!found.is_empty());
                     pieces.extend(found);
                 }
@@ -361,44 +492,18 @@ impl PlanMap {
 
         self.traced = traced;
 
-        let arr = arrangement(&pieces, self.tol.snap);
-        let mut labels: Vec<Option<(usize, usize)>> = Vec::with_capacity(arr.faces.len());
-        for face in &arr.faces {
-            let Some(p) = deep_point(face) else {
-                labels.push(None);
-                continue;
-            };
+        let mut splits = 0;
+        let made = cells_of(&pieces, self.tol.snap, &mut |p| {
             let s = touched.iter().find(|c| c.region.contains(p));
             let t = tools.iter().find(|c| c.region.contains(p));
             let mut split = false;
-            labels.push(self.combine(p, s, t, op, &mut split)?);
-            report.split_faces += usize::from(split);
-        }
-
-        // Boundaries are the edges with different columns on their sides.
-        let label = |f: Option<usize>| f.and_then(|f| labels[f]);
-        let boundary: Vec<Piece> = arr
-            .edges
-            .iter()
-            .filter(|e| label(e.left) != label(e.right))
-            .map(|e| Piece {
-                id: e.id.clone(),
-                curve: e.curve,
-            })
-            .collect();
-        let face_boxes: Vec<[f64; 4]> = arr.faces.iter().map(|f| f.bbox()).collect();
+            let column = self.combine(p, s, t, op, &mut split)?;
+            splits += usize::from(split);
+            Ok(column)
+        })?;
+        report.split_faces = splits;
         self.cells = kept;
-        for region in arrange(&boundary, self.tol.snap) {
-            let Some(p) = deep_point(&region) else {
-                continue;
-            };
-            let face = arr.faces.iter().zip(&face_boxes).position(|(f, b)| {
-                p[0] >= b[0] && p[0] <= b[2] && p[1] >= b[1] && p[1] <= b[3] && f.contains(p)
-            });
-            if let Some((top, bot)) = label(face) {
-                self.cells.push(Cell { region, top, bot });
-            }
-        }
+        self.cells.extend(made);
         report.cells_after = self.cells.len();
         Ok(report)
     }
@@ -565,14 +670,14 @@ mod tests {
         let ridge = PlanMap::slab(
             rect(0.031, 0.01, 0.069, 0.07, "ridge"),
             under(0.0, "ridge:bottom"),
-            Sheet {
-                surface: brep_core::ir::Surface::Cylinder {
+            Sheet::of(
+                brep_core::ir::Surface::Cylinder {
                     frame,
                     radius: 0.02,
                 },
-                up: true,
-                name: "ridge:top".into(),
-            },
+                true,
+                "ridge:top",
+            ),
         );
         let r = m.apply(&ridge, Op::Add).unwrap();
         assert_eq!(r.cells_after, 2, "{r:?}");

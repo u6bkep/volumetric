@@ -183,14 +183,61 @@ pub fn trace_zero(
         for k in chain.windows(2) {
             fill(g, points[k[0]], points[k[1]], tol, 0, &mut line);
         }
+        // An open curve found on the grid ends at the last grid line it
+        // crosses: follow it to where it really ends.
+        if chain[0] != chain[chain.len() - 1] {
+            follow(g, &mut line, rect, 0.25 * pitch, tol);
+            line.reverse();
+            follow(g, &mut line, rect, 0.25 * pitch, tol);
+            line.reverse();
+        }
         out.push(line);
     }
     out
 }
 
+/// Continue `line` past its last point along the zero set, until the
+/// function ends or the rectangle does.
+fn follow(g: &dyn Fn(P2) -> Option<f64>, line: &mut Vec<P2>, rect: [f64; 4], step: f64, tol: f64) {
+    let n = line.len();
+    if n < 2 {
+        return;
+    }
+    let inside = |p: P2| p[0] >= rect[0] && p[0] <= rect[2] && p[1] >= rect[1] && p[1] <= rect[3];
+    let mut at = line[n - 1];
+    let mut way = sub(at, line[n - 2]);
+    let mut h = step;
+    for _ in 0..4096 {
+        if h < 1e-9 {
+            break;
+        }
+        let len = norm(way);
+        if len == 0.0 {
+            break;
+        }
+        let ahead = add(at, scale(way, h / len));
+        let next = if inside(ahead) {
+            polish(g, ahead, (1e-3 * h).max(1e-9))
+                .filter(|q| inside(*q) && dist(*q, ahead) < 0.5 * h && g(*q).is_some())
+        } else {
+            None
+        };
+        match next {
+            Some(q) => {
+                fill(g, at, q, tol, 0, line);
+                way = sub(q, at);
+                at = q;
+            }
+            None => h *= 0.5,
+        }
+    }
+}
+
 /// A traced polyline as boundary pieces: one line or arc when the points
 /// lie on one within `exact`, otherwise short lines under a [`FREE`] id.
-pub fn pieces_of(points: &[P2], name: &str, exact: f64) -> Vec<Piece> {
+/// An open curve is made `beyond` longer at its first and its last end,
+/// so that it crosses what it ends on.
+pub fn pieces_of(points: &[P2], name: &str, exact: f64, beyond: [f64; 2]) -> Vec<Piece> {
     let n = points.len();
     if n < 2 {
         return Vec::new();
@@ -207,7 +254,10 @@ pub fn pieces_of(points: &[P2], name: &str, exact: f64) -> Vec<Piece> {
         {
             return vec![Piece {
                 id: name.to_string(),
-                curve: Curve::Line { a: first, b: last },
+                curve: Curve::Line {
+                    a: sub(first, scale(d, beyond[0] / len)),
+                    b: add(last, scale(d, beyond[1] / len)),
+                },
             }];
         }
     }
@@ -233,7 +283,20 @@ pub fn pieces_of(points: &[P2], name: &str, exact: f64) -> Vec<Piece> {
             let curve = if closed {
                 Curve::circle(centre, r)
             } else {
-                Curve::arc_from_ends(centre, first, last, den > 0.0)
+                let arc = Curve::arc_from_ends(centre, first, last, den > 0.0);
+                match arc {
+                    Curve::Arc { c, r, a0, sweep } => {
+                        let room = 0.5 * (core::f64::consts::TAU - sweep.abs());
+                        let more = beyond.map(|b| (b / r).min(room) * sweep.signum());
+                        Curve::Arc {
+                            c,
+                            r,
+                            a0: a0 - more[0],
+                            sweep: sweep + more[0] + more[1],
+                        }
+                    }
+                    line => line,
+                }
             };
             return vec![Piece {
                 id: name.to_string(),
@@ -241,8 +304,18 @@ pub fn pieces_of(points: &[P2], name: &str, exact: f64) -> Vec<Piece> {
             }];
         }
     }
-    points
-        .windows(2)
+    let mut run: Vec<P2> = points.to_vec();
+    if !closed {
+        let ahead = |from: P2, to: P2, by: f64| {
+            let d = sub(to, from);
+            add(to, scale(d, by / norm(d).max(1e-300)))
+        };
+        let head = ahead(points[1], first, beyond[0]);
+        let tail = ahead(points[n - 2], last, beyond[1]);
+        run.insert(0, head);
+        run.push(tail);
+    }
+    run.windows(2)
         .filter(|w| dist(w[0], w[1]) > 0.0)
         .map(|w| Piece {
             id: format!("{FREE}{name}"),
@@ -269,7 +342,7 @@ mod tests {
             let mid = scale(add(w[0], w[1]), 0.5);
             assert!(0.04 - norm(mid) < 2e-7, "chord {}", 0.04 - norm(mid));
         }
-        let pieces = pieces_of(line, "c", 1e-9);
+        let pieces = pieces_of(line, "c", 1e-9, [0.0; 2]);
         assert_eq!(pieces.len(), 1);
         assert!(matches!(pieces[0].curve, Curve::Arc { r, .. } if (r - 0.04).abs() < 1e-12));
     }
@@ -279,20 +352,44 @@ mod tests {
         let g = |p: P2| Some(p[0] + 2.0 * p[1] - 0.01);
         let lines = trace_zero(&g, [0.0, -0.05, 0.1, 0.05], 0.01, 1e-7);
         assert_eq!(lines.len(), 1);
-        let pieces = pieces_of(&lines[0], "l", 1e-9);
+        let pieces = pieces_of(&lines[0], "l", 1e-9, [0.0; 2]);
         assert_eq!(pieces.len(), 1);
         assert!(matches!(pieces[0].curve, Curve::Line { .. }));
 
         let g = |p: P2| Some(p[1] - 0.02 * (30.0 * p[0]).sin());
         let lines = trace_zero(&g, [0.0, -0.05, 0.3, 0.05], 0.005, 1e-7);
         assert_eq!(lines.len(), 1);
-        let pieces = pieces_of(&lines[0], "s", 1e-9);
+        let pieces = pieces_of(&lines[0], "s", 1e-9, [0.0; 2]);
         assert!(pieces.len() > 50);
         assert!(pieces.iter().all(|p| p.id == "free:s"));
         for p in &pieces {
             let m = p.curve.point(0.5);
             assert!((m[1] - 0.02 * (30.0 * m[0]).sin()).abs() < 3e-7);
         }
+    }
+
+    #[test]
+    fn to_the_end_of_the_function() {
+        // A circle of which only the part right of x = 0.0123 is there.
+        let g = |p: P2| (p[0] >= 0.0123).then(|| p[0] * p[0] + p[1] * p[1] - 0.04 * 0.04);
+        let lines = trace_zero(&g, [-0.1, -0.1, 0.1, 0.1], 0.004, 1e-7);
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        for end in [line[0], line[line.len() - 1]] {
+            assert!((end[0] - 0.0123).abs() < 1e-8, "{end:?}");
+            assert!((norm(end) - 0.04).abs() < 1e-12);
+        }
+        let pieces = pieces_of(line, "c", 1e-9, [1e-6; 2]);
+        assert_eq!(pieces.len(), 1);
+        // Made longer, it crosses the line it ended on.
+        let edge = Curve::Line {
+            a: [0.0123, -0.1],
+            b: [0.0123, 0.1],
+        };
+        assert_eq!(
+            sketch_regions_core::geom::intersect(&pieces[0].curve, &edge, 1e-9).len(),
+            2
+        );
     }
 
     #[test]

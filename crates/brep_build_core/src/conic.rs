@@ -187,10 +187,10 @@ pub fn conic_through(points: &[Vec3], tol: f64) -> Option<(Curve3, f64, f64)> {
         y,
         z: cross(x, y),
     };
-    let curve = if (major - minor).abs() <= 1e-12 * major {
+    let curve = if major - minor <= tol {
         Curve3::Circle {
             frame,
-            radius: major,
+            radius: 0.5 * (major + minor),
         }
     } else {
         Curve3::Ellipse {

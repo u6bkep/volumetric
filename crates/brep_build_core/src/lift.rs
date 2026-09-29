@@ -857,9 +857,17 @@ pub fn lift(map: &PlanMap, opts: &LiftOptions) -> Result<Vec<Solid>, String> {
                 }
                 n => {
                     let p = b.plan[v];
+                    let walls: Vec<String> = ends
+                        .iter()
+                        .map(|e| format!("'{}' {:.6}..{:.6}", edges[e.edge].id, e.lo, e.hi))
+                        .collect();
                     return Err(format!(
-                        "{n} walls meet on one vertical over ({:.6}, {:.6}): the solid touches itself there",
-                        p[0], p[1]
+                        "{n} walls meet on the vertical over ({:.6}, {:.6}) between {:.6} and {:.6} (walls ending there: {}): the solid touches itself there",
+                        p[0],
+                        p[1],
+                        w[0].0,
+                        w[1].0,
+                        walls.join(", ")
                     ));
                 }
             }

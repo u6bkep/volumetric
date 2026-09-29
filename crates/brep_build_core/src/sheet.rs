@@ -7,10 +7,15 @@
 //! torus's tube), which is what makes it usable as the top or the bottom
 //! of a column of material.
 
-use brep_core::ir::Surface;
+use brep_core::ir::{NurbsSurface, Surface};
 use brep_core::math::Vec3;
+use brep_core::nurbs::surface_eval;
 use brep_core::surface::SurfaceView;
 use brep_core::topo::surface_normal;
+use std::sync::{Arc, OnceLock};
+
+/// A plan point of a surface and its parameters.
+type Seed = ([f64; 2], [f64; 2]);
 
 #[derive(Clone, Debug)]
 pub struct Sheet {
@@ -19,6 +24,9 @@ pub struct Sheet {
     pub up: bool,
     /// What made it (a feature and a role); goes into face names.
     pub name: String,
+    /// Points of a free-form surface with their parameters, to start
+    /// from; made when first asked for and shared by copies.
+    seeds: Arc<OnceLock<Vec<Seed>>>,
 }
 
 /// Normals flatter than this are the sheet's rim, not the sheet.
@@ -32,35 +40,122 @@ const RIM_REACH: f64 = 1e-6;
 const STEEP: f64 = 0.1;
 
 impl Sheet {
+    /// The part of `surface` whose normal points up, or down.
+    pub fn of(surface: Surface, up: bool, name: &str) -> Sheet {
+        Sheet {
+            surface,
+            up,
+            name: name.to_string(),
+            seeds: Arc::default(),
+        }
+    }
+
     /// The plane through `p` with normal `n` (pointing up or down as
     /// given; `n` must not be horizontal).
     pub fn plane(p: Vec3, n: Vec3, name: &str) -> Sheet {
         let frame = brep_core::math::Frame::from_axis_ref(p, n, [1.0, 0.0, 0.0]);
-        Sheet {
-            surface: Surface::Plane { frame },
-            up: n[2] > 0.0,
-            name: name.to_string(),
-        }
+        Sheet::of(Surface::Plane { frame }, n[2] > 0.0, name)
     }
 
     /// The horizontal plane at height `z`.
     pub fn level(z: f64, name: &str) -> Sheet {
-        Sheet {
-            surface: Surface::Plane {
+        Sheet::of(
+            Surface::Plane {
                 frame: brep_core::math::Frame {
                     origin: [0.0, 0.0, z],
                     ..brep_core::math::Frame::IDENTITY
                 },
             },
-            up: true,
-            name: name.to_string(),
+            true,
+            name,
+        )
+    }
+
+    /// Where the vertical line over `(x, y)` meets a free-form surface:
+    /// `(z, u, v)` of every crossing found from the nearest seeds.
+    fn crossings(&self, n: &NurbsSurface, x: f64, y: f64) -> Vec<(f64, f64, f64)> {
+        let dom = n.domain();
+        let seeds = self.seeds.get_or_init(|| {
+            // A few points per span of the knots.
+            let spans = |knots: &[f64]| knots.windows(2).filter(|k| k[1] > k[0]).count();
+            let nu = (4 * spans(&n.knots_u)).clamp(8, 96);
+            let nv = (4 * spans(&n.knots_v)).clamp(8, 96);
+            let mut seeds = Vec::with_capacity((nu + 1) * (nv + 1));
+            for i in 0..=nu {
+                for j in 0..=nv {
+                    let u = dom[0] + (dom[1] - dom[0]) * i as f64 / nu as f64;
+                    let v = dom[2] + (dom[3] - dom[2]) * j as f64 / nv as f64;
+                    let p = surface_eval(n, u, v).0;
+                    seeds.push(([p[0], p[1]], [u, v]));
+                }
+            }
+            seeds
+        });
+        const STARTS: usize = 8;
+        let mut nearest: [(f64, usize); STARTS] = [(f64::INFINITY, 0); STARTS];
+        for (k, (p, _)) in seeds.iter().enumerate() {
+            let d = (p[0] - x).powi(2) + (p[1] - y).powi(2);
+            if d < nearest[STARTS - 1].0 {
+                let at = nearest.iter().position(|e| d < e.0).unwrap();
+                nearest[at..].rotate_right(1);
+                nearest[at] = (d, k);
+            }
         }
+        let (du, dv) = (dom[1] - dom[0], dom[3] - dom[2]);
+        let mut out: Vec<(f64, f64, f64)> = Vec::new();
+        for &(d, k) in &nearest {
+            if !d.is_finite() {
+                continue;
+            }
+            let [mut u, mut v] = seeds[k].1;
+            let mut found = false;
+            for step in 0..32 {
+                let (p, su, sv) = surface_eval(n, u, v);
+                let (rx, ry) = (x - p[0], y - p[1]);
+                // On the surface, or at its edge with the point just
+                // beyond it.
+                let edge = u == dom[0] || u == dom[1] || v == dom[2] || v == dom[3];
+                if rx.hypot(ry) < 1e-13 || (step > 8 && edge && rx.hypot(ry) < RIM_REACH) {
+                    found = true;
+                    break;
+                }
+                let det = su[0] * sv[1] - su[1] * sv[0];
+                if det == 0.0 || !det.is_finite() {
+                    break;
+                }
+                u = (u + (rx * sv[1] - ry * sv[0]) / det).clamp(dom[0], dom[1]);
+                v = (v + (su[0] * ry - su[1] * rx) / det).clamp(dom[2], dom[3]);
+            }
+            if !found {
+                continue;
+            }
+            let z = surface_eval(n, u, v).0[2];
+            let seen = out.iter().any(|o| {
+                (o.0 - z).abs() < 1e-9 && (o.1 - u).abs() < 1e-6 * du && (o.2 - v).abs() < 1e-6 * dv
+            });
+            if !seen {
+                out.push((z, u, v));
+            }
+        }
+        out
     }
 
     /// `(z, normal)` of the sheet over `(x, y)`: the point where the
     /// vertical line meets the sheet, and the surface normal there.
-    /// `None` where the sheet does not reach.
+    /// `None` where the sheet does not reach. A point within a
+    /// micrometre of the sheet's rim, on either side, is on the rim.
     pub fn at(&self, x: f64, y: f64) -> Option<(f64, Vec3)> {
+        self.over(x, y, true)
+    }
+
+    /// The height as the surface has it, without [`Sheet::at`]'s reach
+    /// for the rim: for following the sheet as a function, where the rim
+    /// is its end and not a place.
+    pub fn z_open(&self, x: f64, y: f64) -> Option<f64> {
+        self.over(x, y, false).map(|(z, _)| z)
+    }
+
+    fn over(&self, x: f64, y: f64, reach: bool) -> Option<(f64, Vec3)> {
         if let Surface::Plane { frame } = &self.surface {
             let n = frame.z;
             if n[2].abs() < RIM {
@@ -74,14 +169,13 @@ impl Sheet {
         // `(z, normal, uv)` of the crossing on this sheet.
         let cast = |x: f64, y: f64, base: f64| -> Option<(f64, Vec3, [f64; 2])> {
             let mut best: Option<(f64, Vec3, [f64; 2])> = None;
-            view.ray_hits([x, y, base], [0.0, 0.0, 1.0], 1e-9, &mut |hit| {
-                let Ok(n) = surface_normal(&self.surface, [hit.u, hit.v]) else {
+            let mut take = |z: f64, uv: [f64; 2]| {
+                let Ok(n) = surface_normal(&self.surface, uv) else {
                     return;
                 };
                 if n[2].abs() < RIM || (n[2] > 0.0) != self.up {
                     return;
                 }
-                let z = base + hit.t;
                 // A surface folded over itself offers several: the
                 // outermost in the sheet's direction.
                 let better = match best {
@@ -89,9 +183,19 @@ impl Sheet {
                     Some((b, _, _)) => (z > b) == self.up,
                 };
                 if better {
-                    best = Some((z, n, [hit.u, hit.v]));
+                    best = Some((z, n, uv));
                 }
-            });
+            };
+            match &self.surface {
+                Surface::Nurbs(n) => {
+                    for (z, u, v) in self.crossings(n, x, y) {
+                        take(z, [u, v]);
+                    }
+                }
+                _ => view.ray_hits([x, y, base], [0.0, 0.0, 1.0], 1e-9, &mut |hit| {
+                    take(base + hit.t, [hit.u, hit.v])
+                }),
+            }
             best
         };
         // From far below, where every crossing is ahead, then again from
@@ -102,6 +206,9 @@ impl Sheet {
                 .filter(|(again, _, _)| (again - z).abs() < 1e-6)
                 .unwrap_or((z, n, uv))
         });
+        if !reach {
+            return hit.map(|(z, n, _)| (z, n));
+        }
         if let Some((z, n, _)) = hit
             && n[2].abs() >= STEEP
         {
@@ -119,15 +226,49 @@ impl Sheet {
             })
         })?;
         match self.rim(&view, [x, y], start) {
-            Some(on) => Some(on),
-            None => hit.map(|(z, n, _)| (z, n)),
+            Some((on, n)) if (on[0] - x).hypot(on[1] - y) <= RIM_REACH => Some((on[2], n)),
+            _ => hit.map(|(z, n, _)| (z, n)),
         }
     }
 
+    /// The point of the sheet's rim nearest the plan point `(x, y)`,
+    /// with the (level) normal there, if the sheet is within `within` of
+    /// the point at all.
+    pub fn rim_near(&self, x: f64, y: f64, within: f64) -> Option<(Vec3, Vec3)> {
+        if matches!(self.surface, Surface::Plane { .. }) {
+            return None;
+        }
+        let view = SurfaceView::from_ir(&self.surface);
+        let crossing = |x: f64, y: f64| -> Option<[f64; 2]> {
+            let mut uv = None;
+            match &self.surface {
+                Surface::Nurbs(n) => {
+                    if let Some(&(_, u, v)) = self.crossings(n, x, y).first() {
+                        uv = Some([u, v]);
+                    }
+                }
+                _ => view.ray_hits([x, y, -64.0], [0.0, 0.0, 1.0], 1e-9, &mut |hit| {
+                    uv = Some([hit.u, hit.v])
+                }),
+            }
+            uv
+        };
+        let start = crossing(x, y).or_else(|| {
+            [0.01, 0.1, 1.0].into_iter().find_map(|part| {
+                (0..8).find_map(|k| {
+                    let a = core::f64::consts::FRAC_PI_4 * k as f64;
+                    crossing(x + part * within * a.cos(), y + part * within * a.sin())
+                })
+            })
+        })?;
+        self.rim(&view, [x, y], start)
+            .filter(|(on, _)| (on[0] - x).hypot(on[1] - y) <= within)
+    }
+
     /// The point of the sheet's rim (where the surface normal is
-    /// horizontal) nearest the plan point `p`, if within reach, found
-    /// from `uv`: its height and normal.
-    fn rim(&self, view: &SurfaceView, p: [f64; 2], mut uv: [f64; 2]) -> Option<(f64, Vec3)> {
+    /// horizontal) nearest the plan point `p`, found from `uv`, and the
+    /// normal there.
+    fn rim(&self, view: &SurfaceView, p: [f64; 2], mut uv: [f64; 2]) -> Option<(Vec3, Vec3)> {
         // Zero where the normal is level and the way from `p` to the
         // point is along it.
         let f = |uv: [f64; 2]| -> Option<[f64; 2]> {
@@ -167,8 +308,7 @@ impl Sheet {
         }
         let on = view.eval(uv[0], uv[1]);
         let n = surface_normal(&self.surface, uv).ok()?;
-        let off = (on[0] - p[0]).hypot(on[1] - p[1]);
-        (n[2].abs() < 1e-6 && off <= RIM_REACH).then_some((on[2], n))
+        (n[2].abs() < 1e-6).then_some((on, n))
     }
 
     pub fn z(&self, x: f64, y: f64) -> Option<f64> {
@@ -221,16 +361,8 @@ mod tests {
         // Axis along y through (0, 0, 1), radius 0.5.
         let frame = Frame::from_axis_ref([0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]);
         let surface = Surface::Cylinder { frame, radius: 0.5 };
-        let upper = Sheet {
-            surface: surface.clone(),
-            up: true,
-            name: "upper".into(),
-        };
-        let lower = Sheet {
-            surface,
-            up: false,
-            name: "lower".into(),
-        };
+        let upper = Sheet::of(surface.clone(), true, "upper");
+        let lower = Sheet::of(surface, false, "lower");
         let h = (0.25f64 - 0.09).sqrt();
         assert!((upper.z(0.3, 4.0).unwrap() - (1.0 + h)).abs() < 1e-12);
         assert!((lower.z(0.3, 4.0).unwrap() - (1.0 - h)).abs() < 1e-12);
@@ -250,16 +382,8 @@ mod tests {
             major: 2.0,
             minor: 0.5,
         };
-        let top = Sheet {
-            surface: surface.clone(),
-            up: true,
-            name: String::new(),
-        };
-        let under = Sheet {
-            surface,
-            up: false,
-            name: String::new(),
-        };
+        let top = Sheet::of(surface.clone(), true, "");
+        let under = Sheet::of(surface, false, "");
         let h = (0.25f64 - 0.04).sqrt();
         assert!((top.z(2.2, 0.0).unwrap() - h).abs() < 1e-9);
         assert!((under.z(0.0, -1.8).unwrap() + h).abs() < 1e-9);

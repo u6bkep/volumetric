@@ -5,6 +5,7 @@
 //! walls are planes and cylinders, every edge is an exact line or circle
 //! and every wall is named after the sketch entity it was swept from.
 
+pub mod body;
 pub mod conic;
 pub mod fit;
 pub mod lift;

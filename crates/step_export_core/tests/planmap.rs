@@ -78,14 +78,14 @@ fn boss(m: &mut PlanMap, region: Region, top: Sheet) {
 }
 
 fn lying_cylinder(through: [f64; 3], along: [f64; 3], radius: f64, up: bool, name: &str) -> Sheet {
-    Sheet {
-        surface: Surface::Cylinder {
+    Sheet::of(
+        Surface::Cylinder {
             frame: Frame::from_axis_ref(through, along, [0.0, 0.0, 1.0]),
             radius,
         },
         up,
-        name: name.into(),
-    }
+        name,
+    )
 }
 
 fn machined() -> PlanMap {
@@ -151,17 +151,17 @@ fn dome() -> PlanMap {
     boss(
         &mut m,
         disc([0.04, 0.04], 0.03, "dome"),
-        Sheet {
-            surface: Surface::Sphere {
+        Sheet::of(
+            Surface::Sphere {
                 frame: Frame {
                     origin: [0.04, 0.04, 0.0],
                     ..Frame::IDENTITY
                 },
                 radius: 0.04,
             },
-            up: true,
-            name: "dome:top".into(),
-        },
+            true,
+            "dome:top",
+        ),
     );
     // A sloping cut through dome and block: its crease with the sphere
     // is a circle in space and an ellipse in the plan.
@@ -323,4 +323,140 @@ fn two_lumps() {
         under(-1.0, "saw:below"),
     );
     check("halves", &m, 2);
+}
+
+use brep_build_core::body::{Sweep, sweep};
+use brep_build_core::planmap::Tolerances;
+
+fn region_at(pieces: &[Piece], inside: P2) -> Region {
+    arrange(pieces, 1e-9)
+        .into_iter()
+        .find(|r| r.contains(inside))
+        .expect("a region")
+}
+
+fn line(id: &str, a: P2, b: P2) -> Piece {
+    Piece {
+        id: id.into(),
+        curve: Curve::Line { a, b },
+    }
+}
+
+fn arc(id: &str, c: P2, from: P2, to: P2) -> Piece {
+    Piece {
+        id: id.into(),
+        curve: Curve::arc_from_ends(c, from, to, true),
+    }
+}
+
+fn unit(v: [f64; 3]) -> [f64; 3] {
+    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    [v[0] / n, v[1] / n, v[2] / n]
+}
+
+/// A slot 60 x 20 mm with round ends, about the origin.
+fn slot() -> Region {
+    region_at(
+        &[
+            line("bottom", [-0.02, -0.01], [0.02, -0.01]),
+            arc("right", [0.02, 0.0], [0.02, -0.01], [0.02, 0.01]),
+            line("top", [0.02, 0.01], [-0.02, 0.01]),
+            arc("left", [-0.02, 0.0], [-0.02, 0.01], [-0.02, -0.01]),
+        ],
+        [0.0, 0.0],
+    )
+}
+
+#[test]
+fn swept_sideways() {
+    let tol = Tolerances::default();
+    // A bar with a round back: a profile on an upright plane, swept
+    // level. A body of its own.
+    let profile = region_at(
+        &[
+            line("floor", [-0.02, 0.0], [0.02, 0.0]),
+            line("east", [0.02, 0.0], [0.02, 0.02]),
+            arc("roof", [0.0, 0.005], [0.02, 0.02], [-0.02, 0.02]),
+            line("west", [-0.02, 0.02], [-0.02, 0.0]),
+        ],
+        [0.0, 0.01],
+    );
+    let bar = sweep(
+        &Sweep {
+            region: profile,
+            origin: [0.03, 0.01, 0.0],
+            u: [1.0, 0.0, 0.0],
+            v: [0.0, 0.0, 1.0],
+            dir: [0.0, 1.0, 0.0],
+            w0: 0.0,
+            w1: 0.06,
+            name: "bar".into(),
+        },
+        &tol,
+    )
+    .unwrap();
+    let mut m = PlanMap::new();
+    m.apply(&bar, Op::Add).unwrap();
+    let solids = check("bar", &m, 1);
+    let (planes, cylinders, _, other) = kinds(&solids[0]);
+    assert_eq!((planes, cylinders, other), (5, 1, 0));
+
+    // A hose channel through the block from its side: a circle on an
+    // upright plane, its centre on the block's underside.
+    let mut m = block();
+    let hose = sweep(
+        &Sweep {
+            region: disc([0.04, 0.0], 0.008, "hose"),
+            origin: [0.0, 0.0, 0.0],
+            u: [0.0, 1.0, 0.0],
+            v: [0.0, 0.0, 1.0],
+            dir: [1.0, 0.0, 0.0],
+            w0: f64::NEG_INFINITY,
+            w1: f64::INFINITY,
+            name: "hose".into(),
+        },
+        &tol,
+    )
+    .unwrap();
+    m.apply(&hose, Op::Remove).unwrap();
+    let solids = check("hosed", &m, 1);
+    // The channel's mouths are half circles.
+    let circles = solids[0]
+        .edges
+        .iter()
+        .filter(
+            |e| matches!(e.curve, Curve3::Circle { radius, .. } if (radius - 0.008).abs() < 1e-9),
+        )
+        .count();
+    assert_eq!(circles, 2);
+    assert!(
+        solids[0]
+            .edges
+            .iter()
+            .all(|e| !matches!(e.curve, Curve3::Nurbs(_)))
+    );
+}
+
+#[test]
+fn swept_at_a_slant() {
+    let tol = Tolerances::default();
+    // A trough: the slot on the block's top, swept down into it at a
+    // slant.
+    let mut m = block();
+    let trough = sweep(
+        &Sweep {
+            region: slot(),
+            origin: [0.05, 0.04, 0.03],
+            u: [1.0, 0.0, 0.0],
+            v: [0.0, 1.0, 0.0],
+            dir: unit([0.3, 0.2, -1.0]),
+            w0: -0.01,
+            w1: 0.015,
+            name: "trough".into(),
+        },
+        &tol,
+    )
+    .unwrap();
+    m.apply(&trough, Op::Remove).unwrap();
+    check("trough", &m, 1);
 }

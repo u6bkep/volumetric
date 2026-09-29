@@ -7,3 +7,6 @@ description = "Constructors of brep_core topological solids from exact 2D region
 [dependencies]
 brep_core = { path = "../brep_core" }
 sketch_regions_core = { path = "../sketch_regions_core" }
+
+[dev-dependencies]
+heightfield_core = { path = "../heightfield_core" }
