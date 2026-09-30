@@ -19,7 +19,7 @@
 //! so the two models of the same feature tree agree.
 
 use crate::sheet::Sheet;
-use crate::trace::{pieces_of, trace_zero};
+use crate::trace::{pieces_of, thin, trace_zero};
 use brep_core::math::Vec3;
 use sketch_regions_core::geom::{add, scale};
 use sketch_regions_core::{Curve, P2, Piece, Region, arrange, arrangement};
@@ -41,7 +41,10 @@ pub struct Cell {
 /// Lengths in metres.
 #[derive(Clone, Copy, Debug)]
 pub struct Tolerances {
-    /// Plan points closer than this are one vertex.
+    /// Plan points closer than this are one vertex, and curves that run
+    /// closer than this to each other are one curve: more than any two
+    /// computations of one curve differ by (a surface fitted to 0.05 um,
+    /// chords within 0.2 um), less than anything that is meant.
     pub snap: f64,
     /// Heights closer than this are equal (a cut from a face starts on
     /// it, not a rounding error below it).
@@ -52,16 +55,21 @@ pub struct Tolerances {
     pub exact: f64,
     /// Grid a trace starts from.
     pub pitch: f64,
+    /// After an overlay the cells are checked against the rules they
+    /// were made by, at the points of a grid this wide over all that
+    /// was arranged; 0 for no check.
+    pub check: f64,
 }
 
 impl Default for Tolerances {
     fn default() -> Self {
         Tolerances {
-            snap: 1e-7,
+            snap: 1e-6,
             height: 1e-7,
             chord: 2e-7,
             exact: 1e-9,
             pitch: 5e-4,
+            check: 2e-3,
         }
     }
 }
@@ -75,6 +83,60 @@ pub struct Report {
     pub cells_before: usize,
     pub cells_after: usize,
     pub creases: usize,
+    /// Points of the check ([`Tolerances::check`]) at which the cells
+    /// that came out do not hold the column the rules give there.
+    pub wrong: Vec<Wrong>,
+    pub checked: usize,
+}
+
+/// A point of the check that failed.
+#[derive(Clone, Debug)]
+pub struct Wrong {
+    pub at: P2,
+    /// The height that is wrong, by how much.
+    pub off: f64,
+    /// The column by the rules and the column of the cell over the
+    /// point: the names of the sheets, top over bottom, and their
+    /// heights where they have one.
+    pub rules: String,
+    pub cells: String,
+    pub rules_z: Option<(f64, f64)>,
+    pub cells_z: Option<(f64, f64)>,
+}
+
+impl Report {
+    /// The failed points of the check by what is wrong: the columns, how
+    /// many points, the box they are in and the most any is off by.
+    pub fn wrong_groups(&self) -> Vec<(String, usize, [f64; 4], f64)> {
+        let mut groups: Vec<(String, usize, [f64; 4], f64)> = Vec::new();
+        for w in &self.wrong {
+            let what = format!("the rules leave {}, the cells hold {}", w.rules, w.cells);
+            let k = match groups.iter().position(|g| g.0 == what) {
+                Some(k) => k,
+                None => {
+                    let none = [
+                        f64::INFINITY,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        f64::NEG_INFINITY,
+                    ];
+                    groups.push((what, 0, none, 0.0));
+                    groups.len() - 1
+                }
+            };
+            let g = &mut groups[k];
+            g.1 += 1;
+            g.2 = [
+                g.2[0].min(w.at[0]),
+                g.2[1].min(w.at[1]),
+                g.2[2].max(w.at[0]),
+                g.2[3].max(w.at[1]),
+            ];
+            g.3 = g.3.max(w.off);
+        }
+        groups.sort_by(|a, b| b.1.cmp(&a.1));
+        groups
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -113,6 +175,10 @@ fn clip(pieces: Vec<Piece>, a: &Region, b: &Region, snap: f64) -> Vec<Piece> {
         for w in stops.windows(2) {
             let part = piece.curve.sub(w[0], w[1]);
             let mid = part.point(0.5);
+            // (A part that runs along a boundary of either cell, where
+            // the sheets meet as the cells do, is in or out by a rounding
+            // error: the boundary is there already, and in the
+            // arrangement the part is that boundary drawn again.)
             if part.length() > snap && a.contains(mid) && b.contains(mid) {
                 out.push(Piece {
                     id: piece.id.clone(),
@@ -123,6 +189,10 @@ fn clip(pieces: Vec<Piece>, a: &Region, b: &Region, snap: f64) -> Vec<Piece> {
     }
     out
 }
+
+/// A face of an arrangement is a sliver when it is on average no wider
+/// than this many times the distance within which points are one.
+const SLIVER: f64 = 8.0;
 
 /// A point of the region as far from its boundary as a handful of tries
 /// find: the place to ask what the region is.
@@ -161,12 +231,51 @@ pub fn cells_of(
     column: &mut dyn FnMut(P2) -> Result<Option<(usize, usize)>, String>,
 ) -> Result<Vec<Cell>, String> {
     let arr = arrangement(pieces, snap);
+    // A face no wider than curves are apart that are meant to be one is
+    // what is left between them where they meet at a small angle. Its
+    // sheets end beside it as likely as beyond it: where they cannot
+    // say what stands over it, it is its neighbour's.
+    let mut thin = vec![false; arr.faces.len()];
     let mut labels: Vec<Option<(usize, usize)>> = Vec::with_capacity(arr.faces.len());
-    for face in &arr.faces {
-        labels.push(match deep_point(face) {
-            Some(p) => column(p)?,
-            None => None,
+    for (f, face) in arr.faces.iter().enumerate() {
+        let Some(p) = deep_point(face) else {
+            labels.push(None);
+            continue;
+        };
+        labels.push(match column(p) {
+            Ok(label) => label,
+            Err(e) => {
+                let around: f64 = face.pieces().map(|q| q.curve.length()).sum();
+                if 2.0 * face.area > SLIVER * snap * around {
+                    return Err(e);
+                }
+                thin[f] = true;
+                None
+            }
         });
+    }
+    for f in (0..arr.faces.len()).filter(|&f| thin[f]) {
+        // The neighbour it has most of its boundary with.
+        let mut along: Vec<(Option<(usize, usize)>, f64)> = Vec::new();
+        for e in &arr.edges {
+            let other = match (e.left == Some(f), e.right == Some(f)) {
+                (true, false) => e.right,
+                (false, true) => e.left,
+                _ => continue,
+            };
+            if other.is_some_and(|g| thin[g]) {
+                continue;
+            }
+            let label = other.and_then(|g| labels[g]);
+            let len = e.curve.length();
+            match along.iter_mut().find(|(l, _)| *l == label) {
+                Some(entry) => entry.1 += len,
+                None => along.push((label, len)),
+            }
+        }
+        if let Some((label, _)) = along.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)) {
+            labels[f] = label;
+        }
     }
     let label = |f: Option<usize>| f.and_then(|f| labels[f]);
     let boundary: Vec<Piece> = arr
@@ -357,6 +466,7 @@ impl PlanMap {
         };
         let mut out = Vec::new();
         for line in lines.iter_mut() {
+            *line = thin(line, 10.0 * self.tol.snap);
             let n = line.len();
             let closed =
                 n > 3 && sketch_regions_core::geom::dist(line[0], line[n - 1]) <= self.tol.exact;
@@ -502,6 +612,109 @@ impl PlanMap {
             Ok(column)
         })?;
         report.split_faces = splits;
+        // The check: what the rules leave over a point against what the
+        // cells made hold there. The cells are the arrangement's word
+        // for it, and an arrangement that a curve failed to close says
+        // something else.
+        if self.tol.check > 0.0 {
+            let boxes: Vec<[f64; 4]> = made.iter().map(|c| c.region.bbox()).collect();
+            let touched_boxes: Vec<[f64; 4]> = touched.iter().map(|c| c.region.bbox()).collect();
+            // Over everything the overlay arranged: the cells the body
+            // does not reach are made again as well.
+            let all = touched_boxes.iter().chain(&tool_boxes).fold(
+                [
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ],
+                |a, b| {
+                    [
+                        a[0].min(b[0]),
+                        a[1].min(b[1]),
+                        a[2].max(b[2]),
+                        a[3].max(b[3]),
+                    ]
+                },
+            );
+            let step = self.tol.check;
+            let within = |cells: &'_ [Cell], boxes: &[[f64; 4]], p: P2| -> Option<usize> {
+                cells.iter().zip(boxes).position(|(c, b)| {
+                    p[0] >= b[0]
+                        && p[0] <= b[2]
+                        && p[1] >= b[1]
+                        && p[1] <= b[3]
+                        && c.region.contains(p)
+                })
+            };
+            let (nx, ny) = if all[0] < all[2] {
+                (
+                    ((all[2] - all[0]) / step).ceil() as usize,
+                    ((all[3] - all[1]) / step).ceil() as usize,
+                )
+            } else {
+                (0, 0)
+            };
+            for i in 0..nx {
+                for j in 0..ny {
+                    // Off the grid lines of anything drawn on round
+                    // numbers.
+                    let p = [
+                        all[0] + (i as f64 + 0.4142) * step,
+                        all[1] + (j as f64 + 0.3183) * step,
+                    ];
+                    let s = within(&touched, &touched_boxes, p).map(|k| &touched[k]);
+                    let t = within(&tools, &tool_boxes, p).map(|k| &tools[k]);
+                    if s.is_none() && t.is_none() {
+                        continue;
+                    }
+                    if [s, t]
+                        .into_iter()
+                        .flatten()
+                        .any(|c| c.region.boundary_distance(p) < 0.25 * step)
+                    {
+                        continue;
+                    }
+                    let mut split = false;
+                    let Ok(expect) = self.combine(p, s, t, op, &mut split) else {
+                        continue;
+                    };
+                    let got = within(&made, &boxes, p).map(|k| (made[k].top, made[k].bot));
+                    // Next to a crease either side's answer is
+                    // right: by the heights, not the names.
+                    let height = |column: Option<(usize, usize)>| -> Option<(f64, f64)> {
+                        let (top, bot) = column?;
+                        Some((
+                            self.sheets[top].z(p[0], p[1])?,
+                            self.sheets[bot].z(p[0], p[1])?,
+                        ))
+                    };
+                    report.checked += 1;
+                    let off = match (height(expect), height(got)) {
+                        (None, None) => 0.0,
+                        (Some(a), Some(b)) => (a.0 - b.0).abs().max((a.1 - b.1).abs()),
+                        (Some(a), None) | (None, Some(a)) => a.0 - a.1,
+                    };
+                    if off > 1e-5 {
+                        let name = |column: Option<(usize, usize)>| match column {
+                            Some((top, bot)) => format!(
+                                "'{}' over '{}'",
+                                self.sheets[top].name, self.sheets[bot].name
+                            ),
+                            None => "nothing".to_string(),
+                        };
+                        report.wrong.push(Wrong {
+                            at: p,
+                            off,
+                            rules: name(expect),
+                            cells: name(got),
+                            rules_z: height(expect),
+                            cells_z: height(got),
+                        });
+                    }
+                }
+            }
+        }
         self.cells = kept;
         self.cells.extend(made);
         report.cells_after = self.cells.len();

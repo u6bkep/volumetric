@@ -173,6 +173,24 @@ struct Split {
     verts: Vec<P2>,
 }
 
+/// The curve from `from` to `to` that is `c` but for its ends, each
+/// within the tolerance of where `c` had it. A line is the line between
+/// them; an arc stays on its circle, and ends on it abreast of them.
+fn with_ends(c: &Curve, from: P2, to: P2) -> Curve {
+    match *c {
+        Curve::Line { .. } => Curve::Line { a: from, b: to },
+        Curve::Arc { c: centre, r, a0, sweep } => {
+            if sweep.abs() >= std::f64::consts::TAU - 1e-9 || (dist(c.start(), from) == 0.0 && dist(c.end(), to) == 0.0) {
+                return *c;
+            }
+            let near = |angle: f64, old: f64| old + (angle - old + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
+            let b0 = near((from[1] - centre[1]).atan2(from[0] - centre[0]), a0);
+            let b1 = near((to[1] - centre[1]).atan2(to[0] - centre[0]), a0 + sweep);
+            Curve::Arc { c: centre, r, a0: b0, sweep: b1 - b0 }
+        }
+    }
+}
+
 fn angle_key(h: &HalfEdge) -> (f64, f64) {
     let t = h.curve.tangent(0.0);
     (t[1].atan2(t[0]), h.curve.curvature())
@@ -193,6 +211,51 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
             for (t, u) in geom::intersect(&input[i].curve, &input[j].curve, eps) {
                 params[i].push(t);
                 params[j].push(u);
+            }
+        }
+    }
+    // A vertex within eps of a piece is on it. Two computations of one
+    // curve (a sketch line and the edge of a surface fitted up to it, a
+    // crease traced from either side) differ by their tolerances, run
+    // beside each other and cross where chance has it; split at each
+    // other's vertices they are the same edges twice, and one edge below.
+    let mut points: Vec<P2> = Vec::new();
+    for (i, p) in input.iter().enumerate() {
+        for &t in &params[i] {
+            points.push(p.curve.point(t));
+        }
+    }
+    if !points.is_empty() {
+        const N: usize = 64;
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        for q in &points {
+            for k in 0..2 {
+                lo[k] = lo[k].min(q[k]);
+                hi[k] = hi[k].max(q[k]);
+            }
+        }
+        let width = [((hi[0] - lo[0]) / N as f64).max(1e-300), ((hi[1] - lo[1]) / N as f64).max(1e-300)];
+        let cell = |v: f64, k: usize| (((v - lo[k]) / width[k]).floor().max(0.0) as usize).min(N - 1);
+        let mut grid: Vec<Vec<usize>> = vec![Vec::new(); N * N];
+        for (k, q) in points.iter().enumerate() {
+            grid[cell(q[1], 1) * N + cell(q[0], 0)].push(k);
+        }
+        for i in 0..n {
+            let b = boxes[i];
+            for row in cell(b[1] - eps, 1)..=cell(b[3] + eps, 1) {
+                for col in cell(b[0] - eps, 0)..=cell(b[2] + eps, 0) {
+                    for &k in &grid[row * N + col] {
+                        let q = points[k];
+                        if q[0] < b[0] - eps || q[0] > b[2] + eps || q[1] < b[1] - eps || q[1] > b[3] + eps {
+                            continue;
+                        }
+                        let (t, d) = input[i].curve.nearest(q);
+                        if d <= eps {
+                            params[i].push(t);
+                        }
+                    }
+                }
             }
         }
     }
@@ -290,6 +353,12 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
     // (The middles are compared by distance: rounded to a grid, two
     // within a rounding error of each other can fall either side of a
     // grid line.)
+    // An edge runs from its vertex to its vertex: what comes out of one
+    // arrangement goes into the next, where ends that were one vertex
+    // here have to be one again.
+    for (k, p) in pieces.iter_mut().enumerate() {
+        p.curve = with_ends(&p.curve, verts[vertex_of[2 * k]], verts[vertex_of[2 * k + 1]]);
+    }
     let mut seen: HashMap<(usize, usize), Vec<P2>> = HashMap::new();
     let mut hes: Vec<HalfEdge> = Vec::with_capacity(2 * pieces.len());
     for (k, p) in pieces.iter().enumerate() {
@@ -303,6 +372,10 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
                 continue;
             }
             mids.push(mid);
+        } else if !matches!(p.curve, Curve::Arc { sweep, .. } if sweep.abs() >= std::f64::consts::TAU - 1e-9) {
+            // Both ends at one vertex and not a circle: shorter than
+            // points are apart.
+            continue;
         }
         let f = hes.len();
         hes.push(HalfEdge { from: u, to: v, curve: p.curve, piece: k, twin: f + 1 });
@@ -354,7 +427,12 @@ fn build_split(input: &[Piece], eps: f64) -> Split {
 }
 
 struct Face {
+    /// The loop as walked: a line that ends inside the face is in it
+    /// out and back.
     pieces: Vec<Piece>,
+    /// The loop without the edges it has on both sides: what bounds
+    /// the face.
+    around: Vec<Piece>,
     hes: Vec<usize>,
     area: f64,
 }
@@ -384,12 +462,25 @@ fn walk_faces(split: &Split) -> Vec<Face> {
                 break;
             }
         }
-        let pieces: Vec<Piece> = loop_hes
-            .iter()
-            .map(|&h| Piece { id: split.pieces[split.hes[h].piece].id.clone(), curve: split.hes[h].curve })
-            .collect();
+        let piece_of = |h: usize| Piece { id: split.pieces[split.hes[h].piece].id.clone(), curve: split.hes[h].curve };
+        let pieces: Vec<Piece> = loop_hes.iter().map(|&h| piece_of(h)).collect();
+        // A line that ends inside the face (a construction line left in
+        // a sketch) is walked out and back, and bounds nothing.
+        let mut around: Vec<usize> = Vec::with_capacity(loop_hes.len());
+        for &h in &loop_hes {
+            if around.last().is_some_and(|&last| split.hes[last].twin == h) {
+                around.pop();
+            } else {
+                around.push(h);
+            }
+        }
+        while around.len() > 1 && split.hes[around[around.len() - 1]].twin == around[0] {
+            around.pop();
+            around.remove(0);
+        }
+        let around: Vec<Piece> = around.into_iter().map(piece_of).collect();
         let area = loop_area(&pieces);
-        faces.push(Face { pieces, hes: loop_hes, area });
+        faces.push(Face { pieces, around, hes: loop_hes, area });
     }
     faces
 }
@@ -407,8 +498,11 @@ fn assemble_regions(faces: Vec<Face>, eps: f64) -> Vec<Region> {
     let mut pos_index: Vec<usize> = Vec::new();
     for (i, f) in faces.iter().enumerate() {
         if f.area > eps * eps {
+            // (The ids are of all that was walked, as they were before
+            // such lines were left out of the boundary: regions are
+            // looked up by them.)
             let ids = f.pieces.iter().map(|p| p.id.clone()).collect();
-            positives.push(Region { outer: f.pieces.clone(), holes: Vec::new(), ids, area: f.area });
+            positives.push(Region { outer: f.around.clone(), holes: Vec::new(), ids, area: f.area });
             pos_index.push(i);
         }
     }
@@ -416,7 +510,7 @@ fn assemble_regions(faces: Vec<Face>, eps: f64) -> Vec<Region> {
         if f.area > -(eps * eps) {
             continue;
         }
-        let probe = face_probe(&f.pieces, 4.0 * eps);
+        let probe = face_probe(&f.around, 4.0 * eps);
         let mut best: Option<(usize, f64)> = None;
         for (k, r) in positives.iter().enumerate() {
             if loop_winding(&r.outer, probe) > std::f64::consts::PI {
@@ -431,7 +525,7 @@ fn assemble_regions(faces: Vec<Face>, eps: f64) -> Vec<Region> {
             for p in &f.pieces {
                 r.ids.insert(p.id.clone());
             }
-            r.holes.push(f.pieces.clone());
+            r.holes.push(f.around.clone());
         }
     }
     positives
@@ -470,7 +564,10 @@ pub struct Arrangement {
 }
 
 /// The arrangement of `pieces` (see [`arrange`] for `eps`). Pieces that
-/// coincide are one edge, under the id of the first.
+/// coincide are one edge, under the id of the first. The faces are as
+/// they were walked: a line that ends inside a face is in its boundary,
+/// out and back (in [`arrange`]'s regions it is not), so that a point
+/// far from a face's boundary is far from every edge.
 pub fn arrangement(pieces: &[Piece], eps: f64) -> Arrangement {
     let split = build_split(pieces, eps);
     let loops = walk_faces(&split);
@@ -486,10 +583,13 @@ pub fn arrangement(pieces: &[Piece], eps: f64) -> Arrangement {
         }
     }
     for (i, f) in loops.iter().enumerate() {
-        if f.area > -(eps * eps) {
+        if face_of_loop[i].is_some() {
             continue;
         }
-        let probe = face_probe(&f.pieces, 4.0 * eps);
+        // (A loop around no area is lines that end in the face they are
+        // in: its edges have that face on both sides.)
+        let first = Piece { id: String::new(), curve: split.hes[f.hes[0]].curve };
+        let probe = face_probe(&[first], 4.0 * eps);
         let mut best: Option<(usize, f64)> = None;
         for (k, r) in faces.iter().enumerate() {
             if loop_winding(&r.outer, probe) > std::f64::consts::PI && best.is_none_or(|(_, a)| loop_area(&r.outer) < a) {
@@ -499,10 +599,10 @@ pub fn arrangement(pieces: &[Piece], eps: f64) -> Arrangement {
         if let Some((k, _)) = best {
             face_of_loop[i] = Some(k);
             let r = &mut faces[k];
-            r.area += f.area;
             for p in &f.pieces {
                 r.ids.insert(p.id.clone());
             }
+            r.area += f.area;
             r.holes.push(f.pieces.clone());
         }
     }
@@ -873,6 +973,99 @@ mod corner_tests {
 
 
 
+
+#[cfg(test)]
+mod dangling {
+    use super::*;
+
+    #[test]
+    fn a_line_that_ends_inside_a_face_bounds_nothing() {
+        let l = |id: &str, a: P2, b: P2| Piece { id: id.into(), curve: Curve::Line { a, b } };
+        // A square, a line from the middle of its top side half way
+        // down, and a line inside it that touches nothing.
+        let pieces = vec![
+            l("b", [0.0, 0.0], [1.0, 0.0]),
+            l("r", [1.0, 0.0], [1.0, 1.0]),
+            l("t", [1.0, 1.0], [0.0, 1.0]),
+            l("l", [0.0, 1.0], [0.0, 0.0]),
+            l("spur", [0.5, 1.0], [0.5, 0.5]),
+            l("loose", [0.2, 0.2], [0.3, 0.2]),
+        ];
+        let regions = arrange(&pieces, 1e-9);
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        assert!((r.area - 1.0).abs() < 1e-12);
+        assert!(r.holes.is_empty(), "{:?}", r.holes);
+        // The top side in two parts, the others whole.
+        assert_eq!(r.outer.len(), 5, "{:?}", r.outer);
+        assert!(r.outer.iter().all(|p| p.id != "spur"));
+        let around: f64 = r.outer.iter().map(|p| p.curve.length()).sum();
+        assert!((around - 4.0).abs() < 1e-12);
+        // The arrangement has the lines as edges, the face on both
+        // sides.
+        let arr = arrangement(&pieces, 1e-9);
+        assert_eq!(arr.faces.len(), 1);
+        for id in ["spur", "loose"] {
+            let e = arr.edges.iter().find(|e| e.id == id).unwrap();
+            assert_eq!((e.left, e.right), (Some(0), Some(0)), "{id}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod twice {
+    use super::*;
+
+    fn l(id: &str, a: P2, b: P2) -> Piece {
+        Piece { id: id.into(), curve: Curve::Line { a, b } }
+    }
+
+    #[test]
+    fn a_second_drawing_of_a_side() {
+        // A square, and its top side drawn again a little off and cut in
+        // three, overhanging at one end.
+        let mut pieces = vec![l("b", [0.0, 0.0], [1.0, 0.0]), l("r", [1.0, 0.0], [1.0, 1.0]), l("t", [1.0, 1.0], [0.0, 1.0]), l("l", [0.0, 1.0], [0.0, 0.0])];
+        pieces.push(l("again", [-0.5, 1.0 + 3e-7], [0.3, 1.0 - 2e-7]));
+        pieces.push(l("again", [0.3, 1.0 - 2e-7], [0.7, 1.0 + 4e-7]));
+        pieces.push(l("again", [0.7, 1.0 + 4e-7], [1.0, 1.0]));
+        let arr = arrangement(&pieces, 1e-6);
+        assert_eq!(arr.faces.len(), 1);
+        assert!((arr.faces[0].area - 1.0).abs() < 1e-9);
+        // The side is the first drawing's, in the parts the second cut
+        // it into (at its two joints, and where it crosses between
+        // them); of the second there is the overhang.
+        let of = |id: &str| arr.edges.iter().filter(|e| e.id == id).count();
+        assert_eq!((of("t"), of("again")), (4, 1), "{:?}", arr.edges);
+        let regions = arrange(&pieces, 1e-6);
+        assert_eq!(regions.len(), 1);
+    }
+
+    #[test]
+    fn a_crossing_at_a_small_angle() {
+        // A line across a square's side at a thousandth of a radian,
+        // cut short within the tolerance of the side on its way in and
+        // on its way out: it meets the side at both ends.
+        let mut pieces = vec![l("b", [0.0, 0.0], [1.0, 0.0]), l("r", [1.0, 0.0], [1.0, 1.0]), l("t", [1.0, 1.0], [0.0, 1.0]), l("l", [0.0, 1.0], [0.0, 0.0])];
+        pieces.push(l("m", [0.0, 0.5], [1.0, 0.5]));
+        pieces.push(l("in", [0.2, 0.0], [0.5 - 5e-4, 0.5 - 5e-7]));
+        pieces.push(l("out", [0.5 + 5e-4, 0.5 + 5e-7], [0.8, 1.0]));
+        let arr = arrangement(&pieces, 1e-6);
+        assert_eq!(arr.faces.len(), 4, "{:?}", arr.edges);
+    }
+
+    #[test]
+    fn arcs_of_one_circle() {
+        // A quarter of a circle and, about a centre a little off, the
+        // eighth before its end and the quarter after: one curve.
+        let first = Piece { id: "a".into(), curve: Curve::arc_from_ends([0.0, 0.0], [1.0, 0.0], [0.0, 1.0], true) };
+        let c = [2e-7, -1e-7];
+        let second = Piece { id: "b".into(), curve: Curve::arc_from_ends(c, [c[0] + 0.5f64.sqrt(), c[1] + 0.5f64.sqrt()], [c[0] - 1.0, c[1]], true) };
+        let pieces = vec![first, second, l("x", [-1.0, 0.0], [1.0, 0.0])];
+        let arr = arrangement(&pieces, 1e-6);
+        assert_eq!(arr.faces.len(), 1, "{:?}", arr.edges);
+        assert!((arr.faces[0].area - std::f64::consts::FRAC_PI_2).abs() < 1e-5);
+    }
+}
 
 #[cfg(test)]
 mod strips {

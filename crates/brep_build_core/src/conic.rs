@@ -144,6 +144,11 @@ pub fn conic_through(points: &[Vec3], tol: f64) -> Option<(Curve3, f64, f64)> {
     let (i, j) = if half[0] >= half[1] { (0, 1) } else { (1, 0) };
     let dir = |k: usize| [axes[0][k], axes[1][k]];
     let (major, minor) = (half[i] * size, half[j] * size);
+    // (So flat that its centre is too far off to compute with: no
+    // conic.)
+    if major > crate::trace::FLATTEST * size {
+        return None;
+    }
     let lift = |q: [f64; 2]| add(scale(e1, q[0]), scale(e2, q[1]));
     let origin = add(centroid, scale(lift(centre), size));
     let x = normalize(lift(dir(i)));

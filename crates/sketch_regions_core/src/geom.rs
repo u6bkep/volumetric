@@ -337,22 +337,38 @@ pub fn intersect(a: &Curve, b: &Curve, eps: f64) -> Vec<(f64, f64)> {
                 if (-e1..=1.0 + e1).contains(&t) && (-e2..=1.0 + e2).contains(&u) {
                     out.push((t.clamp(0.0, 1.0), u.clamp(0.0, 1.0)));
                 }
-            } else {
-                // Parallel: overlapping collinear pieces meet at their
-                // shared end points at most (overlaps are left to the caller).
-                for (t, pa) in [(0.0, *p), (1.0, *q)] {
-                    let (u, d) = b.nearest(pa);
-                    if d <= eps {
-                        out.push((t, u));
-                    }
-                }
-                for (u, pb) in [(0.0, *r), (1.0, *s)] {
-                    let (t, d) = a.nearest(pb);
-                    if d <= eps {
-                        out.push((t, u));
-                    }
+            }
+            // An end within eps of the other piece touches it there. At a
+            // small angle the lines cross far from such an end (eps over
+            // the sine of the angle along the piece), and parallel lines
+            // do not cross at all: overlapping collinear pieces meet at
+            // their shared end points at most (overlaps are left to the
+            // caller). Where the pieces cross, that is where they meet:
+            // an end beside the crossing is not a second meeting.
+            let mut touches: Vec<(f64, f64)> = Vec::new();
+            for (t, pa) in [(0.0, *p), (1.0, *q)] {
+                let (u, d) = b.nearest(pa);
+                if d <= eps {
+                    touches.push((t, u));
                 }
             }
+            for (u, pb) in [(0.0, *r), (1.0, *s)] {
+                let (t, d) = a.nearest(pb);
+                if d <= eps {
+                    touches.push((t, u));
+                }
+            }
+            for h in touches {
+                let near = |o: &(f64, f64)| {
+                    dist(a.point(o.0), a.point(h.0)) <= 2.0 * eps
+                        || dist(b.point(o.1), b.point(h.1)) <= 2.0 * eps
+                };
+                if !out.iter().any(near) {
+                    out.push(h);
+                }
+            }
+            out.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            return out;
         }
         (Curve::Line { a: p, b: q }, Curve::Arc { .. }) => {
             let d = sub(*q, *p);

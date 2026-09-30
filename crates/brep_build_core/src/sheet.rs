@@ -14,9 +14,174 @@ use brep_core::surface::SurfaceView;
 use brep_core::topo::surface_normal;
 use std::sync::{Arc, OnceLock};
 
-/// A plan point of a surface, its parameters, and which way the surface
-/// faces there (the vertical part of `dS/du x dS/dv`).
-type Seed = ([f64; 2], [f64; 2], f64);
+/// A free-form surface as triangles over the plan, in buckets: where to
+/// start looking for the surface over a plan point.
+#[derive(Debug)]
+struct Shadow {
+    /// Corners in the plan and in the surface's parameters.
+    triangles: Vec<[([f64; 2], [f64; 2]); 3]>,
+    /// The plan's bucket grid: origin, bucket size, counts.
+    origin: [f64; 2],
+    size: f64,
+    count: [usize; 2],
+    /// Triangles by bucket.
+    buckets: Vec<Vec<u32>>,
+}
+
+impl Shadow {
+    fn of(n: &NurbsSurface) -> Shadow {
+        let dom = n.domain();
+        // A few steps per span of the knots.
+        let spans = |knots: &[f64]| knots.windows(2).filter(|k| k[1] > k[0]).count();
+        let nu = (3 * spans(&n.knots_u)).clamp(32, 192);
+        let nv = (3 * spans(&n.knots_v)).clamp(32, 192);
+        let at = |i: usize, j: usize| -> ([f64; 2], [f64; 2]) {
+            let u = dom[0] + (dom[1] - dom[0]) * i as f64 / nu as f64;
+            let v = dom[2] + (dom[3] - dom[2]) * j as f64 / nv as f64;
+            let p = surface_eval(n, u, v).0;
+            ([p[0], p[1]], [u, v])
+        };
+        let grid: Vec<Vec<([f64; 2], [f64; 2])>> = (0..=nu)
+            .map(|i| (0..=nv).map(|j| at(i, j)).collect())
+            .collect();
+        let mut triangles = Vec::with_capacity(2 * nu * nv);
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for i in 0..nu {
+            for j in 0..nv {
+                let (a, b, c, d) = (
+                    grid[i][j],
+                    grid[i + 1][j],
+                    grid[i + 1][j + 1],
+                    grid[i][j + 1],
+                );
+                triangles.push([a, b, c]);
+                triangles.push([a, c, d]);
+                for q in [a.0, b.0, c.0, d.0] {
+                    for k in 0..2 {
+                        lo[k] = lo[k].min(q[k]);
+                        hi[k] = hi[k].max(q[k]);
+                    }
+                }
+            }
+        }
+        // About one triangle's width per bucket.
+        let area = (hi[0] - lo[0]) * (hi[1] - lo[1]);
+        let size = (area / triangles.len().max(1) as f64).sqrt().max(1e-6) * 1.5;
+        let pad = 2.0 * EDGE_REACH;
+        let origin = [lo[0] - pad, lo[1] - pad];
+        let count = [
+            (((hi[0] - origin[0] + pad) / size).ceil() as usize).clamp(1, 2048),
+            (((hi[1] - origin[1] + pad) / size).ceil() as usize).clamp(1, 2048),
+        ];
+        let mut shadow = Shadow {
+            triangles,
+            origin,
+            size,
+            count,
+            buckets: vec![Vec::new(); count[0] * count[1]],
+        };
+        for (t, tri) in shadow.triangles.iter().enumerate() {
+            let (mut a, mut b) = ([usize::MAX; 2], [0usize; 2]);
+            for (q, _) in tri {
+                for k in 0..2 {
+                    let at =
+                        (((q[k] - origin[k]) / size).floor().max(0.0) as usize).min(count[k] - 1);
+                    a[k] = a[k].min(at);
+                    b[k] = b[k].max(at);
+                }
+            }
+            for i in a[0]..=b[0] {
+                for j in a[1]..=b[1] {
+                    shadow.buckets[j * count[0] + i].push(t as u32);
+                }
+            }
+        }
+        shadow
+    }
+
+    /// Parameters to start from for the crossings over `(x, y)` on the
+    /// side of the surface that faces `up`: of every triangle facing
+    /// that way that holds the point, or is within reach of it.
+    fn starts(&self, x: f64, y: f64, up: bool) -> Vec<[f64; 2]> {
+        let mut out = Vec::new();
+        let at = |q: f64, k: usize| ((q - self.origin[k]) / self.size).floor();
+        let (i, j) = (at(x, 0), at(y, 1));
+        if i < -1.0 || j < -1.0 || i > self.count[0] as f64 || j > self.count[1] as f64 {
+            return out;
+        }
+        let mut near: Option<(f64, [f64; 2])> = None;
+        let bucket = |i: f64, j: f64| -> Option<&Vec<u32>> {
+            (i >= 0.0 && j >= 0.0 && (i as usize) < self.count[0] && (j as usize) < self.count[1])
+                .then(|| &self.buckets[j as usize * self.count[0] + i as usize])
+        };
+        // The triangles are flat where the surface is not: beside a fold
+        // the point can be on the surface and in none of them, and then
+        // the nearest one is where to start.
+        for (di, dj) in [
+            (0.0, 0.0),
+            (-1.0, 0.0),
+            (1.0, 0.0),
+            (0.0, -1.0),
+            (0.0, 1.0),
+            (-1.0, -1.0),
+            (1.0, -1.0),
+            (-1.0, 1.0),
+            (1.0, 1.0),
+        ] {
+            let Some(list) = bucket(i + di, j + dj) else {
+                continue;
+            };
+            for &t in list {
+                let [a, b, c] = self.triangles[t as usize];
+                let (e1, e2) = (
+                    [b.0[0] - a.0[0], b.0[1] - a.0[1]],
+                    [c.0[0] - a.0[0], c.0[1] - a.0[1]],
+                );
+                let det = e1[0] * e2[1] - e1[1] * e2[0];
+                if det == 0.0 || (det > 0.0) != up {
+                    continue;
+                }
+                let d = [x - a.0[0], y - a.0[1]];
+                let (s, t) = (
+                    (d[0] * e2[1] - d[1] * e2[0]) / det,
+                    (e1[0] * d[1] - e1[1] * d[0]) / det,
+                );
+                let uv = |s: f64, t: f64| {
+                    [
+                        a.1[0] + s * (b.1[0] - a.1[0]) + t * (c.1[0] - a.1[0]),
+                        a.1[1] + s * (b.1[1] - a.1[1]) + t * (c.1[1] - a.1[1]),
+                    ]
+                };
+                const SLACK: f64 = 1e-9;
+                if s >= -SLACK && t >= -SLACK && s + t <= 1.0 + SLACK {
+                    out.push(uv(s, t));
+                    continue;
+                }
+                // Outside it: how far, and the nearest point of it.
+                let (cs, ct) = {
+                    let (s, t) = (s.clamp(0.0, 1.0), t.clamp(0.0, 1.0));
+                    let sum = s + t;
+                    if sum > 1.0 {
+                        (s / sum, t / sum)
+                    } else {
+                        (s, t)
+                    }
+                };
+                let off = ((cs - s) * e1[0] + (ct - t) * e2[0])
+                    .hypot((cs - s) * e1[1] + (ct - t) * e2[1]);
+                if off <= self.size && near.is_none_or(|n| off < n.0) {
+                    near = Some((off, uv(cs, ct)));
+                }
+            }
+        }
+        if out.is_empty()
+            && let Some((_, uv)) = near
+        {
+            out.push(uv);
+        }
+        out
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Sheet {
@@ -25,16 +190,38 @@ pub struct Sheet {
     pub up: bool,
     /// What made it (a feature and a role); goes into face names.
     pub name: String,
-    /// Points of a free-form surface with their parameters, to start
-    /// from; made when first asked for and shared by copies.
-    seeds: Arc<OnceLock<Vec<Seed>>>,
+    /// A free-form surface's shadow, to start from; made when first
+    /// asked for and shared by copies.
+    shadow: Arc<OnceLock<Shadow>>,
 }
 
 /// Normals flatter than this are the sheet's rim, not the sheet.
 const RIM: f64 = 1e-9;
 
-/// A plan point this close to the rim is on it.
-const RIM_REACH: f64 = 1e-6;
+/// A plan point this close to the rim is on it: the rim in the plan is
+/// chords of the curve, between vertices that are where the arrangement
+/// has them, within its tolerance
+/// ([`Tolerances::snap`](crate::planmap::Tolerances::snap)) of where
+/// they were computed.
+const RIM_REACH: f64 = 2.5e-6;
+
+/// How far a sheet is taken to reach.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// As far as the surface has it.
+    Open,
+    /// Just beyond its rim and its edges as well.
+    Beyond,
+    /// And within reach of the rim, on either side, the rim.
+    Rim,
+}
+
+/// A plan point this far beyond an edge of the sheet's patch is on the
+/// edge: the edge in the plan is where the arrangement has it, within
+/// its tolerance ([`Tolerances::snap`](crate::planmap::Tolerances::snap))
+/// and the fit's of where the patch has it. (Across an edge that is not
+/// the rim the height changes as the slope has it.)
+const EDGE_REACH: f64 = 4e-6;
 
 /// Where the normal is at least this far from level the sheet's height
 /// is well defined by the plan point.
@@ -47,7 +234,7 @@ impl Sheet {
             surface,
             up,
             name: name.to_string(),
-            seeds: Arc::default(),
+            shadow: Arc::default(),
         }
     }
 
@@ -72,8 +259,9 @@ impl Sheet {
         )
     }
 
-    /// Where the vertical line over `(x, y)` meets a free-form surface:
-    /// `(z, u, v)` of every crossing found from the nearest seeds.
+    /// Where the vertical line over `(x, y)` meets a free-form surface on
+    /// the side that faces the sheet's way: `(z, u, v)` of every
+    /// crossing.
     fn crossings(&self, n: &NurbsSurface, x: f64, y: f64) -> Vec<(f64, f64, f64)> {
         let dom = n.domain();
         // Which way the surface faces: over a plan point a surface that
@@ -81,50 +269,15 @@ impl Sheet {
         // sheet's is the one facing its way.
         let facing = |su: Vec3, sv: Vec3| su[0] * sv[1] - su[1] * sv[0];
         let ours = |f: f64| (f > 0.0) == self.up;
-        let seeds = self.seeds.get_or_init(|| {
-            // A few points per span of the knots.
-            let spans = |knots: &[f64]| knots.windows(2).filter(|k| k[1] > k[0]).count();
-            let nu = (4 * spans(&n.knots_u)).clamp(8, 96);
-            let nv = (4 * spans(&n.knots_v)).clamp(8, 96);
-            let mut seeds = Vec::with_capacity((nu + 1) * (nv + 1));
-            for i in 0..=nu {
-                for j in 0..=nv {
-                    let u = dom[0] + (dom[1] - dom[0]) * i as f64 / nu as f64;
-                    let v = dom[2] + (dom[3] - dom[2]) * j as f64 / nv as f64;
-                    let (p, su, sv) = surface_eval(n, u, v);
-                    seeds.push(([p[0], p[1]], [u, v], facing(su, sv)));
-                }
-            }
-            seeds
-        });
-        const STARTS: usize = 8;
-        let mut nearest: [(f64, usize); STARTS] = [(f64::INFINITY, 0); STARTS];
-        for (k, (p, _, f)) in seeds.iter().enumerate() {
-            if !ours(*f) {
-                continue;
-            }
-            let d = (p[0] - x).powi(2) + (p[1] - y).powi(2);
-            if d < nearest[STARTS - 1].0 {
-                let at = nearest.iter().position(|e| d < e.0).unwrap();
-                nearest[at..].rotate_right(1);
-                nearest[at] = (d, k);
-            }
-        }
+        let shadow = self.shadow.get_or_init(|| Shadow::of(n));
         let (du, dv) = (dom[1] - dom[0], dom[3] - dom[2]);
         let mut out: Vec<(f64, f64, f64)> = Vec::new();
-        for &(d, k) in &nearest {
-            if !d.is_finite() {
-                continue;
-            }
-            let [mut u, mut v] = seeds[k].1;
+        for [mut u, mut v] in shadow.starts(x, y, self.up) {
             let mut found = false;
-            for step in 0..48 {
+            for _ in 0..32 {
                 let (p, su, sv) = surface_eval(n, u, v);
                 let (rx, ry) = (x - p[0], y - p[1]);
-                // On the surface, or at its edge with the point just
-                // beyond it.
-                let edge = u == dom[0] || u == dom[1] || v == dom[2] || v == dom[3];
-                if rx.hypot(ry) < 1e-13 || (step > 8 && edge && rx.hypot(ry) < RIM_REACH) {
+                if rx.hypot(ry) < 1e-13 {
                     found = true;
                     break;
                 }
@@ -139,7 +292,7 @@ impl Sheet {
                 // The whole step, or as much of it as stays on the
                 // sheet's side of the fold.
                 let mut part = 1.0;
-                let mut moved = false;
+                let mut to = None;
                 for _ in 0..12 {
                     let (nu, nv) = (
                         (u + part * mu).clamp(dom[0], dom[1]),
@@ -147,13 +300,23 @@ impl Sheet {
                     );
                     let (_, su, sv) = surface_eval(n, nu, nv);
                     if ours(facing(su, sv)) {
-                        (u, v) = (nu, nv);
-                        moved = true;
+                        to = Some((nu, nv));
                         break;
                     }
                     part *= 0.5;
                 }
-                if !moved {
+                let Some((nu, nv)) = to else {
+                    break;
+                };
+                // Held at an edge with the point just beyond it: on the
+                // edge. (Held, not passing: on its way along an edge the
+                // search is as near the point as this many times.)
+                let held = (nu - u).abs() <= 1e-12 * du && (nv - v).abs() <= 1e-12 * dv;
+                (u, v) = (nu, nv);
+                if held {
+                    let edge = u == dom[0] || u == dom[1] || v == dom[2] || v == dom[3];
+                    let off = rx.hypot(ry);
+                    found = off < 1e-11 || (edge && off < EDGE_REACH);
                     break;
                 }
             }
@@ -176,17 +339,32 @@ impl Sheet {
     /// `None` where the sheet does not reach. A point within a
     /// micrometre of the sheet's rim, on either side, is on the rim.
     pub fn at(&self, x: f64, y: f64) -> Option<(f64, Vec3)> {
-        self.over(x, y, true)
+        self.over(x, y, Reach::Rim)
+    }
+
+    /// The height as the surface has it over a point of its shadow, and
+    /// the rim's or the edge's over a point just beyond: for a curve
+    /// that crosses the rim, whose points within reach of the rim are
+    /// not the rim's (a point as far inside the rim as `d` is below or
+    /// above it by the square root of `d` times the diameter).
+    pub fn z_within(&self, x: f64, y: f64) -> Option<f64> {
+        self.over(x, y, Reach::Beyond).map(|(z, _)| z)
+    }
+
+    /// Whether the plan point is on the sheet's rim.
+    pub fn on_rim(&self, x: f64, y: f64) -> bool {
+        self.rim_near(x, y, RIM_REACH)
+            .is_some_and(|(on, _)| (on[0] - x).hypot(on[1] - y) <= RIM_REACH)
     }
 
     /// The height as the surface has it, without [`Sheet::at`]'s reach
     /// for the rim: for following the sheet as a function, where the rim
     /// is its end and not a place.
     pub fn z_open(&self, x: f64, y: f64) -> Option<f64> {
-        self.over(x, y, false).map(|(z, _)| z)
+        self.over(x, y, Reach::Open).map(|(z, _)| z)
     }
 
-    fn over(&self, x: f64, y: f64, reach: bool) -> Option<(f64, Vec3)> {
+    fn over(&self, x: f64, y: f64, reach: Reach) -> Option<(f64, Vec3)> {
         if let Surface::Plane { frame } = &self.surface {
             let n = frame.z;
             if n[2].abs() < RIM {
@@ -237,29 +415,109 @@ impl Sheet {
                 .filter(|(again, _, _)| (again - z).abs() < 1e-6)
                 .unwrap_or((z, n, uv))
         });
-        if !reach {
+        if reach == Reach::Open {
             return hit.map(|(z, n, _)| (z, n));
         }
         if let Some((z, n, _)) = hit
-            && n[2].abs() >= STEEP
+            && (n[2].abs() >= STEEP || reach == Reach::Beyond)
         {
             return Some((z, n));
         }
         // Near where the sheet turns vertical its height is as uncertain
         // as the square root of the plan point's error: a point within
         // reach of the rim is on it.
-        let start = hit.map(|h| h.2).or_else(|| {
-            [1e-6, 1e-5, 1e-4].into_iter().find_map(|reach| {
-                (0..8).find_map(|k| {
-                    let a = core::f64::consts::FRAC_PI_4 * k as f64;
-                    cast(x + reach * a.cos(), y + reach * a.sin(), -64.0).map(|h| h.2)
-                })
+        // (From the crossing, or from a crossing nearby: the first from
+        // which the rim is found within reach.)
+        let nearby = [1e-6, 1e-5, 1e-4, 1e-3].into_iter().flat_map(|reach| {
+            (0..8).filter_map(move |k| {
+                let a = core::f64::consts::FRAC_PI_4 * k as f64;
+                cast(x + reach * a.cos(), y + reach * a.sin(), -64.0).map(|h| h.2)
             })
-        })?;
-        match self.rim(&view, [x, y], start) {
-            Some((on, n)) if (on[0] - x).hypot(on[1] - y) <= RIM_REACH => Some((on[2], n)),
-            _ => hit.map(|(z, n, _)| (z, n)),
+        });
+        hit.map(|h| h.2)
+            .into_iter()
+            .chain(nearby)
+            .find_map(|start| {
+                self.rim(&view, [x, y], start)
+                    .filter(|(on, _)| (on[0] - x).hypot(on[1] - y) <= RIM_REACH)
+            })
+            .map(|(on, n)| (on[2], n))
+            .or(hit.map(|(z, n, _)| (z, n)))
+            .or_else(|| self.on_edge(x, y))
+    }
+
+    /// The sheet over a plan point on the shadow of one of the patch's
+    /// own edges, where the edge is the sheet's or the rim's: `(z,
+    /// normal)`. Where an edge runs into the rim the plan says nothing
+    /// of the patch's parameters in either direction (across the edge
+    /// there is no patch, across the rim no way), but along the edge it
+    /// does.
+    fn on_edge(&self, x: f64, y: f64) -> Option<(f64, Vec3)> {
+        let Surface::Nurbs(n) = &self.surface else {
+            return None;
+        };
+        let dom = n.domain();
+        let (du, dv) = (dom[1] - dom[0], dom[3] - dom[2]);
+        let edges: [&dyn Fn(f64) -> [f64; 2]; 4] = [
+            &|t| [dom[0] + t * du, dom[2]],
+            &|t| [dom[0] + t * du, dom[3]],
+            &|t| [dom[0], dom[2] + t * dv],
+            &|t| [dom[1], dom[2] + t * dv],
+        ];
+        const N: usize = 128;
+        let mut best: Option<(f64, [f64; 2])> = None;
+        for edge in edges {
+            let off = |t: f64| {
+                let [u, v] = edge(t);
+                let p = surface_eval(n, u, v).0;
+                (p[0] - x).hypot(p[1] - y)
+            };
+            // (An edge that stands upright is over one plan point from
+            // end to end, and at no height in particular.)
+            let plan = |t: f64| {
+                let [u, v] = edge(t);
+                let p = surface_eval(n, u, v).0;
+                [p[0], p[1]]
+            };
+            let (a, m, b) = (plan(0.0), plan(0.5), plan(1.0));
+            if (a[0] - m[0]).hypot(a[1] - m[1]) + (b[0] - m[0]).hypot(b[1] - m[1])
+                <= 4.0 * EDGE_REACH
+            {
+                continue;
+            }
+            let Some((k, _)) = (0..=N)
+                .map(|k| (k, off(k as f64 / N as f64)))
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+            else {
+                continue;
+            };
+            // The least between the neighbours of the nearest sample.
+            let (mut lo, mut hi) = (
+                k.saturating_sub(1) as f64 / N as f64,
+                (k + 1).min(N) as f64 / N as f64,
+            );
+            let golden = 0.5 * (5f64.sqrt() - 1.0);
+            for _ in 0..64 {
+                let (a, b) = (hi - golden * (hi - lo), lo + golden * (hi - lo));
+                if off(a) <= off(b) {
+                    hi = b;
+                } else {
+                    lo = a;
+                }
+            }
+            let t = 0.5 * (lo + hi);
+            let d = off(t);
+            if best.is_none_or(|(b, _)| d < b) {
+                best = Some((d, edge(t)));
+            }
         }
+        let (d, uv) = best?;
+        if d > EDGE_REACH {
+            return None;
+        }
+        let normal = surface_normal(&self.surface, uv).ok()?;
+        (normal[2].abs() < STEEP || (normal[2] > 0.0) == self.up)
+            .then(|| (surface_eval(n, uv[0], uv[1]).0[2], normal))
     }
 
     /// The point of the sheet's rim nearest the plan point `(x, y)`,
@@ -401,7 +659,7 @@ mod tests {
         // On the rim, and a rounding error beyond it.
         assert!((upper.z(0.5, 3.0).unwrap() - 1.0).abs() < 1e-9);
         assert!((lower.z(-0.5 - 1e-13, 3.0).unwrap() - 1.0).abs() < 1e-9);
-        assert!(upper.z(0.5 + 2e-6, 3.0).is_none());
+        assert!(upper.z(0.5 + 4e-6, 3.0).is_none());
         let (_, gx, gy) = upper.slope(0.3, 0.0).unwrap();
         assert!((gx + 0.3 / h).abs() < 1e-9 && gy.abs() < 1e-12);
     }

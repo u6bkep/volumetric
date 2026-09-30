@@ -303,10 +303,24 @@ pub fn envelope(faces: &[FaceSpec], tol: &Tolerances) -> Result<PlanMap, String>
                         edge(&|t| flat(span.at(t * len)), &format!("edge{k}"));
                     }
                 }
-                // Where it turns vertical: the level normal, followed in
-                // the patch's own parameters brought to the unit square.
                 let (du, dv) = (dom[1] - dom[0], dom[3] - dom[2]);
                 let own = |q: P2| (dom[0] + q[0] * du, dom[2] + q[1] * dv);
+                // A patch that stands upright all over is a wall: its
+                // edges' shadows are all there is of it in the plan.
+                let upright = (0..=8).all(|i| {
+                    (0..=8).all(|j| {
+                        let (u, v) = own([i as f64 / 8.0, j as f64 / 8.0]);
+                        let (_, su, sv) = brep_core::nurbs::surface_eval(surface, u, v);
+                        let n = cross(su, sv);
+                        n[2].abs() <= 1e-6 * norm(n)
+                    })
+                });
+                if upright {
+                    sheets.push(Vec::new());
+                    continue;
+                }
+                // Where it turns vertical: the level normal, followed in
+                // the patch's own parameters brought to the unit square.
                 let level = |q: P2| -> Option<f64> {
                     if q[0] < 0.0 || q[0] > 1.0 || q[1] < 0.0 || q[1] > 1.0 {
                         return None;

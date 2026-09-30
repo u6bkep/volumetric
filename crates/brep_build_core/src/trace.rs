@@ -15,6 +15,9 @@ use std::collections::HashMap;
 /// arc begin with this; consecutive pieces of one id are one curve.
 pub const FREE: &str = "free:";
 
+/// An arc's radius is at most this many times its chord.
+pub const FLATTEST: f64 = 1e4;
+
 /// A root of `g` on the segment `a..b`, whose ends have opposite signs.
 fn root_on(g: &dyn Fn(P2) -> Option<f64>, a: P2, b: P2, ga: f64) -> P2 {
     let (mut lo, mut hi) = (0.0f64, 1.0f64);
@@ -179,6 +182,13 @@ pub fn trace_zero(
         if chain.len() < 2 {
             continue;
         }
+        // Where the function has a gap (a node it gives nothing at) the
+        // grid shows one curve in parts, and each part followed to its
+        // ends is the whole curve: once is enough.
+        let probe = points[chain[chain.len() / 2]];
+        if out.iter().any(|line| on_polyline(line, probe, 4.0 * tol)) {
+            continue;
+        }
         let mut line = vec![points[chain[0]]];
         for k in chain.windows(2) {
             fill(g, points[k[0]], points[k[1]], tol, 0, &mut line);
@@ -193,6 +203,38 @@ pub fn trace_zero(
         }
         out.push(line);
     }
+    out
+}
+
+/// Whether `p` is within `tol` of the polyline.
+fn on_polyline(line: &[P2], p: P2, tol: f64) -> bool {
+    line.windows(2).any(|w| {
+        let lo = [w[0][0].min(w[1][0]) - tol, w[0][1].min(w[1][1]) - tol];
+        let hi = [w[0][0].max(w[1][0]) + tol, w[0][1].max(w[1][1]) + tol];
+        p[0] >= lo[0]
+            && p[0] <= hi[0]
+            && p[1] >= lo[1]
+            && p[1] <= hi[1]
+            && Curve::Line { a: w[0], b: w[1] }.nearest(p).1 <= tol
+    })
+}
+
+/// The polyline without the points closer than `spacing` to the one
+/// before: the ends stay. (Followed to where a function ends, a curve
+/// gets there in steps that halve, and pieces as short as the distance
+/// within which points are one are neither pieces nor points.)
+pub fn thin(points: &[P2], spacing: f64) -> Vec<P2> {
+    let n = points.len();
+    if n < 3 {
+        return points.to_vec();
+    }
+    let mut out = vec![points[0]];
+    for p in &points[1..n - 1] {
+        if dist(*p, out[out.len() - 1]) >= spacing && dist(*p, points[n - 1]) >= spacing {
+            out.push(*p);
+        }
+    }
+    out.push(points[n - 1]);
     out
 }
 
@@ -279,7 +321,14 @@ pub fn pieces_of(points: &[P2], name: &str, exact: f64, beyond: [f64; 2]) -> Vec
             ],
         );
         let r = dist(centre, a);
-        if r.is_finite() && points.iter().all(|p| (dist(*p, centre) - r).abs() <= exact) {
+        // (An arc so flat that it is a line to all purposes but this
+        // test is left as it came: its centre is too far off to compute
+        // with.)
+        let reach = dist(first, points[n / 2]).max(dist(first, last));
+        if r.is_finite()
+            && r < FLATTEST * reach
+            && points.iter().all(|p| (dist(*p, centre) - r).abs() <= exact)
+        {
             let curve = if closed {
                 Curve::circle(centre, r)
             } else {
@@ -390,6 +439,33 @@ mod tests {
             sketch_regions_core::geom::intersect(&pieces[0].curve, &edge, 1e-9).len(),
             2
         );
+    }
+
+    #[test]
+    fn a_curve_seen_in_parts_comes_back_once() {
+        // A line, the function undefined at two of the grid's nodes
+        // beside it: the grid shows three parts of it.
+        let gap = |p: P2| {
+            (p[0] - 0.0205).hypot(p[1] - 0.004) < 1e-9 || (p[0] - 0.0605).hypot(p[1] - 0.004) < 1e-9
+        };
+        let g = |p: P2| (!gap(p)).then(|| p[1] - 0.0031 - 0.01 * p[0]);
+        let lines = trace_zero(&g, [0.0005, 0.0, 0.1005, 0.008], 0.004, 1e-7);
+        assert_eq!(lines.len(), 1, "{}", lines.len());
+        let line = &lines[0];
+        assert!(
+            (line[0][0] - 0.0005).abs() < 1e-8 && (line[line.len() - 1][0] - 0.1005).abs() < 1e-8
+        );
+    }
+
+    #[test]
+    fn short_steps_are_thinned() {
+        let line: Vec<P2> = [0.0, 1e-6, 2e-6, 4e-6, 1.2e-5, 5e-5, 9.9e-5, 9.95e-5, 1e-4]
+            .iter()
+            .map(|x| [*x, 0.0])
+            .collect();
+        let kept: Vec<f64> = thin(&line, 1e-5).iter().map(|p| p[0]).collect();
+        assert_eq!(kept, vec![0.0, 1.2e-5, 5e-5, 1e-4]);
+        assert_eq!(thin(&line[..2], 1e-5).len(), 2);
     }
 
     #[test]

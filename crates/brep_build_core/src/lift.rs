@@ -322,24 +322,41 @@ impl Builder<'_> {
                 Geom::Free { .. } => {}
             }
         }
+        // Along the sheet's rim the curve is the rim, at the rim's
+        // height; a curve that crosses the rim is there at its ends, at
+        // most, and on the sheet between them.
+        let rim = [0.25, 0.5, 0.75].into_iter().all(|t| {
+            let p = geom.point(t);
+            s.on_rim(p[0], p[1])
+        });
+        let at = |t: f64| -> Result<Vec3, String> {
+            let p = geom.point(t);
+            if rim || t == 0.0 || t == 1.0 {
+                return up(p);
+            }
+            match s.z_within(p[0], p[1]) {
+                Some(z) => Ok([p[0], p[1], z]),
+                None => up(p),
+            }
+        };
         // Points of the curve, close enough together in space that
         // three of them give its direction, however steeply the sheet
         // rises.
-        let mut pts: Vec<Vec3> = vec![up(geom.point(0.0))?];
+        let mut pts: Vec<Vec3> = vec![at(0.0)?];
         let mut stack: Vec<(f64, Vec3, usize)> = Vec::new();
         for k in (1..=16).rev() {
             let t = k as f64 / 16.0;
-            stack.push((t, up(geom.point(t))?, 0));
+            stack.push((t, at(t)?, 0));
         }
-        let mut at = 0.0;
+        let mut done = 0.0;
         while let Some(&(t, p, depth)) = stack.last() {
             let from = *pts.last().unwrap();
-            let mid = 0.5 * (at + t);
+            let mid = 0.5 * (done + t);
             if norm(sub3(p, from)) > SPACING && depth < 20 {
-                stack.push((mid, up(geom.point(mid))?, depth + 1));
+                stack.push((mid, at(mid)?, depth + 1));
             } else {
                 pts.push(p);
-                at = t;
+                done = t;
                 stack.pop();
             }
         }
