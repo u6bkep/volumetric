@@ -103,6 +103,78 @@ impl Span {
         self.at(self.len())
     }
 
+    /// The span with its end moved to `p`, a little way from where it
+    /// was: a line ends there, an arc abreast of it on its circle, a
+    /// free curve's last control point goes there.
+    pub fn with_end(&self, p: Vec3) -> Span {
+        match self {
+            Span::Line { a, .. } => Span::Line { a: *a, b: p },
+            Span::Arc {
+                c,
+                x,
+                y,
+                r,
+                a0,
+                sweep,
+            } => {
+                let d = sub(p, *c);
+                let angle = dot(d, *y).atan2(dot(d, *x));
+                let was = a0 + sweep;
+                let turn = (angle - was + core::f64::consts::PI).rem_euclid(core::f64::consts::TAU)
+                    - core::f64::consts::PI;
+                Span::Arc {
+                    c: *c,
+                    x: *x,
+                    y: *y,
+                    r: *r,
+                    a0: *a0,
+                    sweep: sweep + turn,
+                }
+            }
+            Span::Free { curve, len } => {
+                let mut curve = curve.clone();
+                let last = curve.ctrl.len() - 1;
+                let w = curve.ctrl[last][3];
+                curve.ctrl[last] = [p[0] * w, p[1] * w, p[2] * w, w];
+                Span::Free { curve, len: *len }
+            }
+        }
+    }
+
+    /// The span with its start moved to `p`, as [`Span::with_end`].
+    pub fn with_start(&self, p: Vec3) -> Span {
+        match self {
+            Span::Line { b, .. } => Span::Line { a: p, b: *b },
+            Span::Arc {
+                c,
+                x,
+                y,
+                r,
+                a0,
+                sweep,
+            } => {
+                let d = sub(p, *c);
+                let angle = dot(d, *y).atan2(dot(d, *x));
+                let turn = (angle - a0 + core::f64::consts::PI).rem_euclid(core::f64::consts::TAU)
+                    - core::f64::consts::PI;
+                Span::Arc {
+                    c: *c,
+                    x: *x,
+                    y: *y,
+                    r: *r,
+                    a0: a0 + turn,
+                    sweep: sweep - turn,
+                }
+            }
+            Span::Free { curve, len } => {
+                let mut curve = curve.clone();
+                let w = curve.ctrl[0][3];
+                curve.ctrl[0] = [p[0] * w, p[1] * w, p[2] * w, w];
+                Span::Free { curve, len: *len }
+            }
+        }
+    }
+
     /// The length along the span of its point nearest `p`, and the
     /// distance.
     pub fn nearest(&self, p: Vec3) -> (f64, f64) {
@@ -263,7 +335,28 @@ pub struct Chain {
 }
 
 impl Chain {
-    pub fn new(spans: Vec<Span>, vertex: Vec<bool>, closed: bool) -> Chain {
+    /// The two sides of a joint are one point: a span whose end is a
+    /// rounding error, or a fitting tolerance, from the next one's start
+    /// is ended there (a loft takes a patch's edge from either side).
+    /// An arc stays on its circle, so it is the other span that moves
+    /// where one of the two is an arc.
+    pub fn new(mut spans: Vec<Span>, vertex: Vec<bool>, closed: bool) -> Chain {
+        let n = spans.len();
+        for k in 0..n {
+            if k + 1 == n && !closed {
+                break;
+            }
+            let next = (k + 1) % n;
+            let gap = norm(sub(spans[k].end(), spans[next].start()));
+            if gap == 0.0 || gap > 1e-5 {
+                continue;
+            }
+            if matches!(spans[k], Span::Arc { .. }) && !matches!(spans[next], Span::Arc { .. }) {
+                spans[next] = spans[next].with_start(spans[k].end());
+            } else {
+                spans[k] = spans[k].with_end(spans[next].start());
+            }
+        }
         let mut cum = vec![0.0];
         for s in &spans {
             cum.push(cum.last().unwrap() + s.len());
@@ -409,6 +502,40 @@ impl Chain {
 mod tests {
     use super::*;
     use core::f64::consts::FRAC_PI_2;
+
+    #[test]
+    fn joints_are_one_point() {
+        // A line, an arc and a free curve that miss each other by a
+        // micrometre.
+        let line = Span::Line {
+            a: [0.0, 0.0, 0.0],
+            b: [1.0, 1e-6, 0.0],
+        };
+        let arc = Span::Arc {
+            c: [1.0, 1.0, 0.0],
+            x: [0.0, -1.0, 0.0],
+            y: [1.0, 0.0, 0.0],
+            r: 1.0,
+            a0: 0.0,
+            sweep: FRAC_PI_2 - 1e-6,
+        };
+        let free = Span::through(&[[2.0, 1.0, 1e-6], [2.5, 1.5, 0.0], [3.0, 2.0, 0.0]]);
+        let chain = Chain::new(vec![line, arc, free], vec![true; 3], false);
+        for w in chain.spans.windows(2) {
+            assert!(
+                norm(sub(w[0].end(), w[1].start())) < 1e-12,
+                "{:?} {:?}",
+                w[0].end(),
+                w[1].start()
+            );
+        }
+        // The arc is still its circle (both its neighbours moved), the
+        // free curve moved by no more than the gap.
+        assert!((norm(sub(chain.spans[1].at(0.5), [1.0, 1.0, 0.0])) - 1.0).abs() < 1e-12);
+        assert!((chain.spans[1].len() - (FRAC_PI_2 - 1e-6)).abs() < 1e-12);
+        let (_, d) = chain.spans[2].nearest([2.5, 1.5, 0.0]);
+        assert!(d < 1e-6, "{d}");
+    }
 
     fn quarter() -> Span {
         Span::Arc {

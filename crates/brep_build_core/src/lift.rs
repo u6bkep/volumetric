@@ -349,10 +349,26 @@ impl Builder<'_> {
             stack.push((t, at(t)?, 0));
         }
         let mut done = 0.0;
+        let mut asked = 0usize;
         while let Some(&(t, p, depth)) = stack.last() {
             let from = *pts.last().unwrap();
             let mid = 0.5 * (done + t);
             if norm(sub3(p, from)) > SPACING && depth < 20 {
+                // (A curve that will not settle is a sheet answering
+                // with different heights at neighbouring points.)
+                asked += 1;
+                if asked > 20_000 {
+                    return Err(format!(
+                        "the curve on sheet {sheet} ({}) from ({:.6}, {:.6}) to ({:.6}, {:.6}) does not settle: at {t:.6} heights {:.6} and {:.6}",
+                        s.name,
+                        geom.point(0.0)[0],
+                        geom.point(0.0)[1],
+                        geom.point(1.0)[0],
+                        geom.point(1.0)[1],
+                        from[2],
+                        p[2]
+                    ));
+                }
                 stack.push((mid, at(mid)?, depth + 1));
             } else {
                 pts.push(p);

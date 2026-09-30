@@ -515,7 +515,16 @@ impl Sheet {
         if d > EDGE_REACH {
             return None;
         }
-        let normal = surface_normal(&self.surface, uv).ok()?;
+        // The normal there, or a little way in where the patch pinches
+        // to a point (a corner both profiles of a loft share) and has
+        // none at the corner itself.
+        let normal = surface_normal(&self.surface, uv).ok().or_else(|| {
+            let inward = [
+                uv[0] + 1e-3 * du * (0.5 * (dom[0] + dom[1]) - uv[0]).signum(),
+                uv[1] + 1e-3 * dv * (0.5 * (dom[2] + dom[3]) - uv[1]).signum(),
+            ];
+            surface_normal(&self.surface, inward).ok()
+        })?;
         (normal[2].abs() < STEEP || (normal[2] > 0.0) == self.up)
             .then(|| (surface_eval(n, uv[0], uv[1]).0[2], normal))
     }
@@ -558,6 +567,15 @@ impl Sheet {
     /// horizontal) nearest the plan point `p`, found from `uv`, and the
     /// normal there.
     fn rim(&self, view: &SurfaceView, p: [f64; 2], mut uv: [f64; 2]) -> Option<(Vec3, Vec3)> {
+        let dom = match &self.surface {
+            Surface::Nurbs(n) => n.domain(),
+            _ => [
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+            ],
+        };
         // Zero where the normal is level and the way from `p` to the
         // point is along it.
         let f = |uv: [f64; 2]| -> Option<[f64; 2]> {
@@ -590,8 +608,15 @@ impl Sheet {
             }
             let du = -(f0[0] * j[1][1] - f0[1] * j[0][1]) / det;
             let dv = -(j[0][0] * f0[1] - j[1][0] * f0[0]) / det;
-            uv = [uv[0] + du, uv[1] + dv];
-            if (du / h[0]).abs() + (dv / h[1]).abs() < 1e-6 {
+            // Within the patch: beyond its edges the surface goes on as
+            // a polynomial does, to no purpose.
+            let next = [
+                (uv[0] + du).clamp(dom[0], dom[1]),
+                (uv[1] + dv).clamp(dom[2], dom[3]),
+            ];
+            let moved = [next[0] - uv[0], next[1] - uv[1]];
+            uv = next;
+            if (moved[0] / h[0]).abs() + (moved[1] / h[1]).abs() < 1e-6 {
                 break;
             }
         }
